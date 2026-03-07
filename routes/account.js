@@ -7,6 +7,7 @@ import {
   normalizeAvatarUrl,
   withNormalizedAvatar,
 } from "../utils/avatarUrl.js";
+import { refreshAvatarUrl } from "../utils/avatarSignedUrl.js";
 
 const router = express.Router();
 
@@ -111,7 +112,8 @@ router.put("/", verifySupabaseToken, async (req, res) => {
       .maybeSingle();
 
     if (updateErr) throw updateErr;
-    return res.json(withNormalizedAvatar(updated));
+    const prepared = await refreshAvatarUrl(withNormalizedAvatar(updated));
+    return res.json(prepared);
   } catch (err) {
     return serverError(res, err);
   }

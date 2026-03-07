@@ -364,6 +364,24 @@ async function createThreadWithInitialMessage({
   return { thread, insertedMessage };
 }
 
+async function loadMemberThreadsForUser(userId, limit = 100) {
+  const { data: rows, error } = await supabaseAdmin
+    .from("support_chat_threads")
+    .select("*")
+    .eq("requester_user_id", userId)
+    .eq("deleted_by_admin", false)
+    .order("last_message_at", { ascending: false })
+    .limit(limit);
+  if (error) throw error;
+
+  const threadIds = (rows || []).map((row) => row.id).filter(Boolean);
+  const rejectionCountMap = await loadRejectionCountMap(threadIds);
+
+  return (rows || []).map((row) =>
+    mapThreadForResponse(row, null, rejectionCountMap[row.id] || 0),
+  );
+}
+
 function normalizeAdminThreadType(value) {
   const normalized = normalizeText(value, 24).toLowerCase();
   if (
@@ -585,6 +603,45 @@ router.post("/admin/threads", adminOnly, async (req, res) => {
   }
 });
 
+// Unified inbox payload for current member messenger + navbar unread indicators.
+router.get("/inbox", async (req, res) => {
+  try {
+    const authUid = req.authUid;
+    if (!authUid) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    await expireOverdueTickets();
+
+    const user = await resolveDbUser(authUid);
+    if (!user) {
+      return res.status(404).json({ message: "User profile not found" });
+    }
+
+    const limit = parseLimit(req.query.limit, 100, 500);
+    const threads = await loadMemberThreadsForUser(user.id, limit);
+    const unreadThreads = threads.filter((thread) => Boolean(thread.is_user_unread));
+
+    return res.json({
+      threads,
+      unreadThreads,
+      unreadCount: unreadThreads.length,
+      lastUpdatedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("[support-inbox] Error:", err);
+
+    if (isMissingSupportChatTablesError(err)) {
+      return missingMigrationResponse(res);
+    }
+
+    return res.status(500).json({
+      message: "Failed to fetch support inbox",
+      error: err?.message || "UNKNOWN_ERROR",
+    });
+  }
+});
+
 // List support threads for authenticated member.
 router.get("/threads/my", async (req, res) => {
   try {
@@ -601,25 +658,9 @@ router.get("/threads/my", async (req, res) => {
     }
 
     const limit = parseLimit(req.query.limit, 100, 500);
+    const threads = await loadMemberThreadsForUser(user.id, limit);
 
-    const { data: rows, error } = await supabaseAdmin
-      .from("support_chat_threads")
-      .select("*")
-      .eq("requester_user_id", user.id)
-      .eq("deleted_by_admin", false)
-      .order("last_message_at", { ascending: false })
-      .limit(limit);
-
-    if (error) throw error;
-
-    const threadIds = (rows || []).map((row) => row.id).filter(Boolean);
-    const rejectionCountMap = await loadRejectionCountMap(threadIds);
-
-    return res.json(
-      (rows || []).map((row) =>
-        mapThreadForResponse(row, null, rejectionCountMap[row.id] || 0),
-      ),
-    );
+    return res.json(threads);
   } catch (err) {
     console.error("[support-threads-my] Error:", err);
 
@@ -1295,3 +1336,4 @@ router.delete("/admin/threads/:threadId", adminOnly, async (req, res) => {
 });
 
 export default router;
+
