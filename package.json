@@ -1,0 +1,25 @@
+{
+  "name": "murekefu-sync-server",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Supabase-only API server",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node ./scripts/ensure-port-free.mjs 3001 && nodemon index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.43.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.3.1",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
+    "pdf-parse": "^2.4.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14",
+    "undici": "^6.1.3"
+  }
+}
