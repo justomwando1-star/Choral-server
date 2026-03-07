@@ -366,15 +366,18 @@ async function getThreadById(threadId) {
   return data || null;
 }
 
-function canAccessThread(thread, user, isAdmin) {
-  if (!thread || !user?.id) return false;
-  if (thread.deleted_by_admin) return false;
+function resolveThreadActorRole(thread, user, isAdmin) {
+  if (!thread || !user?.id) return null;
+  if (thread.deleted_by_admin) return null;
 
-  if (isAdmin) {
-    return thread.assigned_admin_user_id === user.id;
-  }
+  const isRequester = thread.requester_user_id === user.id;
+  const isAssignedAdmin = thread.assigned_admin_user_id === user.id;
 
-  return thread.requester_user_id === user.id;
+  if (isAssignedAdmin && isAdmin) return "admin";
+  if (isRequester) return "member";
+  if (isAssignedAdmin) return "admin";
+
+  return null;
 }
 
 async function expireOverdueTickets() {
@@ -1073,7 +1076,8 @@ router.get("/threads/:threadId/messages", async (req, res) => {
     }
 
     const admin = await isAdminUser(user);
-    if (!canAccessThread(thread, user, admin)) {
+    const actorRole = resolveThreadActorRole(thread, user, admin);
+    if (!actorRole) {
       const message = admin
         ? "Access denied. Pick the ticket first or ask the assigned admin."
         : "Access denied";
@@ -1092,7 +1096,8 @@ router.get("/threads/:threadId/messages", async (req, res) => {
     return res.json({
       thread: mapThreadForResponse(thread),
       messages: messages || [],
-      admin,
+      admin: actorRole === "admin",
+      actorRole,
     });
   } catch (err) {
     console.error("[support-thread-messages] Error:", err);
@@ -1130,7 +1135,8 @@ router.post("/threads/:threadId/messages", async (req, res) => {
     }
 
     const admin = await isAdminUser(user);
-    if (!canAccessThread(thread, user, admin)) {
+    const actorRole = resolveThreadActorRole(thread, user, admin);
+    if (!actorRole) {
       const message = admin
         ? "Access denied. Pick the ticket first or ask the assigned admin."
         : "Access denied";
@@ -1148,7 +1154,7 @@ router.post("/threads/:threadId/messages", async (req, res) => {
       return res.status(400).json({ message: "Message is required" });
     }
 
-    const senderRole = admin ? "admin" : "member";
+    const senderRole = actorRole;
     const now = new Date().toISOString();
 
     const { data: insertedMessage, error: msgErr } = await supabaseAdmin
@@ -1233,14 +1239,16 @@ router.post("/threads/:threadId/read", async (req, res) => {
     }
 
     const admin = await isAdminUser(user);
-    if (!canAccessThread(thread, user, admin)) {
+    const actorRole = resolveThreadActorRole(thread, user, admin);
+    if (!actorRole) {
       const message = admin
         ? "Access denied. Pick the ticket first or ask the assigned admin."
         : "Access denied";
       return res.status(403).json({ message });
     }
 
-    const updates = admin ? { is_admin_unread: false } : { is_user_unread: false };
+    const updates =
+      actorRole === "admin" ? { is_admin_unread: false } : { is_user_unread: false };
 
     const { data: updatedThread, error: updateErr } = await supabaseAdmin
       .from("support_chat_threads")
@@ -1254,7 +1262,8 @@ router.post("/threads/:threadId/read", async (req, res) => {
     return res.json({
       success: true,
       thread: mapThreadForResponse(updatedThread),
-      admin,
+      admin: actorRole === "admin",
+      actorRole,
     });
   } catch (err) {
     console.error("[support-thread-mark-read] Error:", err);

@@ -60,7 +60,7 @@ function normalizeThemeSettings(themeSettings, existingThemeSettings = null) {
 
 /**
  * PUT /api/account
- * Update current user's profile (display_name, avatar_url, theme_settings).
+ * Update current user's profile (display_name, phone, avatar_url, theme_settings).
  * Protected: requires Authorization Bearer token
  */
 router.put("/", verifySupabaseToken, async (req, res) => {
@@ -68,7 +68,7 @@ router.put("/", verifySupabaseToken, async (req, res) => {
     const authUid = req.authUid;
     if (!authUid) return res.status(401).json({ message: "No auth uid" });
 
-    const { displayName, avatarUrl, themeSettings } = req.body;
+    const { displayName, phone, avatarUrl, themeSettings } = req.body;
 
     // Find DB user by auth_uid
     const { data: userRow, error: userError } = await supabaseAdmin
@@ -83,6 +83,12 @@ router.put("/", verifySupabaseToken, async (req, res) => {
 
     const updates = {};
     if (displayName !== undefined) updates.display_name = displayName || null;
+    if (phone !== undefined) {
+      const normalizedPhone = String(phone || "")
+        .trim()
+        .slice(0, 32);
+      updates.phone = normalizedPhone || null;
+    }
     if (avatarUrl !== undefined) {
       updates.avatar_url = normalizeAvatarUrl(avatarUrl);
     }

@@ -5,6 +5,7 @@ import {
   adminOnly,
 } from "../middleware/verifySupabaseToken.js";
 import { withNormalizedAvatar } from "../utils/avatarUrl.js";
+import { refreshAvatarUrl } from "../utils/avatarSignedUrl.js";
 import {
   REGISTRATION_TYPES,
   ensureActiveRegistrationRegulations,
@@ -57,6 +58,19 @@ function isMissingCompositionVerificationColumnError(err) {
   );
 }
 
+function isMissingSupportChatTablesError(err) {
+  const code = String(err?.code || "").toUpperCase();
+  const message = String(err?.message || "").toLowerCase();
+  return (
+    code === "42P01" ||
+    code === "PGRST204" ||
+    code === "PGRST205" ||
+    code === "42703" ||
+    message.includes("support_chat_threads") ||
+    message.includes("support_chat_messages")
+  );
+}
+
 function missingEnrollmentsResponse(res) {
   return res.status(500).json({
     message:
@@ -92,6 +106,20 @@ async function resolveDbUser(userIdentifier) {
   if (byAuthUid) return byAuthUid;
 
   return null;
+}
+
+function sameUserId(a, b) {
+  return (
+    String(a || "").trim().length > 0 &&
+    String(b || "").trim().length > 0 &&
+    String(a).trim() === String(b).trim()
+  );
+}
+
+function sameEmail(a, b) {
+  const left = String(a || "").trim().toLowerCase();
+  const right = String(b || "").trim().toLowerCase();
+  return Boolean(left && right && left === right);
 }
 
 const REGULATIONS_CONTROLLER_FALLBACK = String(
@@ -229,6 +257,27 @@ async function resolveBuyerIdForPurchases(rawBuyerId) {
   throw createBuyerRes.error;
 }
 
+async function resolveBuyerOwnerUserId(rawBuyerId) {
+  const normalized = String(rawBuyerId || "").trim();
+  if (!normalized) return null;
+
+  // Common schema path: payment_submissions.buyer_id references users.id directly.
+  const directUser = await resolveDbUser(normalized).catch(() => null);
+  if (directUser?.id) return directUser.id;
+
+  // Legacy schema path: payment_submissions.buyer_id references buyers.id.
+  const { data: buyerRow, error: buyerErr } = await supabase
+    .from("buyers")
+    .select("id, user_id")
+    .eq("id", normalized)
+    .maybeSingle();
+  if (buyerErr) {
+    if (isMissingBuyersTableError(buyerErr)) return null;
+    throw buyerErr;
+  }
+  return buyerRow?.user_id || null;
+}
+
 router.get("/bootstrap", async (req, res) => {
   try {
     const [rolesRes, invitesRes, pendingReqRes, usersCountRes, compositionsCountRes, purchasesCountRes] =
@@ -345,7 +394,7 @@ router.get("/users", async (req, res) => {
     const { data: users, error: usersErr } = await supabase
       .from("users")
       .select(
-        "id, auth_uid, email, display_name, avatar_url, is_active, composer_request, deleted, created_at, updated_at",
+        "id, auth_uid, email, display_name, phone, avatar_url, is_active, composer_request, deleted, created_at, updated_at",
       )
       .order("created_at", { ascending: false });
     if (usersErr) throw usersErr;
@@ -353,8 +402,15 @@ router.get("/users", async (req, res) => {
       .from("user_roles")
       .select("user_id, role_id, roles(name)");
     if (userRolesErr) console.warn("user_roles fetch warning:", userRolesErr);
+
+    const refreshedUsers = await Promise.all(
+      (users || []).map(async (user) =>
+        await refreshAvatarUrl(withNormalizedAvatar(user)),
+      ),
+    );
+
     return res.json({
-      users: (users || []).map((user) => withNormalizedAvatar(user)),
+      users: refreshedUsers,
       userRoles: userRoles || [],
     });
   } catch (err) {
@@ -783,6 +839,15 @@ router.post("/enrollments/:enrollmentId/admit", async (req, res) => {
       return res.status(404).json({ error: "Enrollment not found" });
     }
 
+    const isSelfEnrollment =
+      sameUserId(current.user_id, adminUser.id) ||
+      (!current.user_id && sameEmail(current.email, adminUser.email));
+    if (isSelfEnrollment) {
+      return res.status(403).json({
+        error: "Admins cannot admit their own enrollment requests.",
+      });
+    }
+
     if (current.status === "admitted") {
       return res.json({
         success: true,
@@ -1060,6 +1125,11 @@ router.post("/registration/payments/:submissionId/approve", async (req, res) => 
     if (submissionErr) throw submissionErr;
     if (!submission) {
       return res.status(404).json({ error: "Registration payment not found" });
+    }
+    if (sameUserId(submission.requester_id, context.adminUser.id)) {
+      return res.status(403).json({
+        error: "You cannot approve your own registration payment submission.",
+      });
     }
     if (submission.status === "approved") {
       return res.json({
@@ -1350,10 +1420,19 @@ router.delete("/invites/:email", async (req, res) => {
 router.post("/users/:userId/promote-composer", async (req, res) => {
   try {
     const { userId: userIdentifier } = req.params;
+    const actingAdmin = await resolveDbUser(req.authUid);
+    if (!actingAdmin?.id) {
+      return res.status(404).json({ error: "Admin user not found" });
+    }
     const user = await resolveDbUser(userIdentifier);
     if (!user)
       return res.status(404).json({ error: "User not found" });
     const userId = user.id;
+    if (sameUserId(userId, actingAdmin.id)) {
+      return res.status(403).json({
+        error: "You cannot approve your own composer access request.",
+      });
+    }
 
     // Mark the composer request as approved in role_requests table
     const { error: updateReqErr } = await supabase
@@ -1426,10 +1505,19 @@ router.post("/users/:userId/promote-composer", async (req, res) => {
 router.post("/users/:userId/promote-admin", async (req, res) => {
   try {
     const { userId: userIdentifier } = req.params;
+    const actingAdmin = await resolveDbUser(req.authUid);
+    if (!actingAdmin?.id) {
+      return res.status(404).json({ error: "Admin user not found" });
+    }
     const user = await resolveDbUser(userIdentifier);
     if (!user)
       return res.status(404).json({ error: "User not found" });
     const userId = user.id;
+    if (sameUserId(userId, actingAdmin.id)) {
+      return res.status(403).json({
+        error: "You cannot approve your own admin access request.",
+      });
+    }
 
     const { data: roleRow } = await supabase
       .from("roles")
@@ -1584,6 +1672,15 @@ router.post("/payment-submissions/:submissionId/approve", async (req, res) => {
     if (submissionErr) throw submissionErr;
     if (!submission) {
       return res.status(404).json({ error: "Payment submission not found" });
+    }
+
+    const submissionOwnerUserId = await resolveBuyerOwnerUserId(
+      submission.buyer_id,
+    );
+    if (sameUserId(submissionOwnerUserId, reviewer.id)) {
+      return res.status(403).json({
+        error: "You cannot approve your own payment submission.",
+      });
     }
 
     if (submission.status === "approved") {
@@ -1770,7 +1867,19 @@ router.post("/payment-submissions/:submissionId/reject", async (req, res) => {
 // Admin notifications endpoint
 router.get("/notifications", async (req, res) => {
   try {
-    const [invitesRes, roleReqRes, paymentReqRes] = await Promise.all([
+    const actingAdmin = await resolveDbUser(req.authUid);
+    const actingAdminId = actingAdmin?.id || null;
+    const actingAdminEmail = String(actingAdmin?.email || "")
+      .trim()
+      .toLowerCase();
+
+    const [
+      invitesRes,
+      roleReqRes,
+      paymentReqRes,
+      enrollmentsRes,
+      announcementThreadsRes,
+    ] = await Promise.all([
       supabase
         .from("invites")
         .select("*")
@@ -1791,6 +1900,23 @@ router.get("/notifications", async (req, res) => {
         .eq("status", "pending")
         .order("submitted_at", { ascending: false })
         .limit(50),
+      supabase
+        .from("enrollments")
+        .select(
+          "id, user_id, full_name, email, music_class, skill_level, status, created_at",
+        )
+        .eq("status", "pending")
+        .order("created_at", { ascending: false })
+        .limit(50),
+      supabase
+        .from("support_chat_threads")
+        .select(
+          "id, requester_user_id, assigned_admin_user_id, subject, context, created_at, last_message_preview, deleted_by_admin",
+        )
+        .eq("deleted_by_admin", false)
+        .ilike("context", "%announcement%")
+        .order("created_at", { ascending: false })
+        .limit(200),
     ]);
 
     if (invitesRes.error) throw invitesRes.error;
@@ -1808,8 +1934,44 @@ router.get("/notifications", async (req, res) => {
       paymentReqData = paymentReqRes.data || [];
     }
 
+    let enrollmentReqData = [];
+    if (enrollmentsRes.error) {
+      if (!isMissingEnrollmentsError(enrollmentsRes.error)) {
+        throw enrollmentsRes.error;
+      }
+      console.warn(
+        "[admin-notifications] enrollments table missing; run migration 021 to enable enrollment notifications",
+      );
+    } else {
+      enrollmentReqData = enrollmentsRes.data || [];
+    }
+
+    let announcementThreads = [];
+    if (announcementThreadsRes.error) {
+      if (!isMissingSupportChatTablesError(announcementThreadsRes.error)) {
+        throw announcementThreadsRes.error;
+      }
+      console.warn(
+        "[admin-notifications] support chat tables missing; announcement notifications disabled",
+      );
+    } else {
+      announcementThreads = announcementThreadsRes.data || [];
+    }
+
     const invitesData = invitesRes.data || [];
     const roleReqData = roleReqRes.data || [];
+
+    const paymentReqDataWithOwner = await Promise.all(
+      (paymentReqData || []).map(async (row) => {
+        const ownerUserId = await resolveBuyerOwnerUserId(row.buyer_id).catch(
+          () => null,
+        );
+        return {
+          ...row,
+          __owner_user_id: ownerUserId || null,
+        };
+      }),
+    );
 
     const items = [];
 
@@ -1830,18 +1992,37 @@ router.get("/notifications", async (req, res) => {
     const roleUserIdentifiers = (roleReqData || [])
       .map((r) => r.user_id)
       .filter(Boolean);
-    const paymentBuyerIds = (paymentReqData || [])
-      .map((p) => p.buyer_id)
+    const paymentBuyerIds = (paymentReqDataWithOwner || [])
+      .flatMap((p) => [p.buyer_id, p.__owner_user_id])
+      .filter(Boolean);
+    const enrollmentUserIds = (enrollmentReqData || [])
+      .map((e) => e.user_id)
+      .filter(Boolean);
+    const enrollmentEmails = (enrollmentReqData || [])
+      .map((e) => String(e?.email || "").trim().toLowerCase())
+      .filter(Boolean);
+    const announcementUserIds = (announcementThreads || [])
+      .flatMap((thread) => [
+        thread.requester_user_id,
+        thread.assigned_admin_user_id,
+      ])
       .filter(Boolean);
     const allUserIdentifiers = [
-      ...new Set([...roleUserIdentifiers, ...paymentBuyerIds]),
+      ...new Set([
+        ...roleUserIdentifiers,
+        ...paymentBuyerIds,
+        ...enrollmentUserIds,
+        ...announcementUserIds,
+      ]),
     ];
     let usersById = {};
     let usersByAuthUid = {};
+    let usersByEmail = {};
     let rolesByUserId = {};
     if (allUserIdentifiers.length > 0) {
       try {
-        const [usersByIdRes, usersByAuthUidRes] = await Promise.all([
+        const [usersByIdRes, usersByAuthUidRes, usersByEmailRes] =
+          await Promise.all([
           supabase
             .from("users")
             .select("id, auth_uid, email, display_name")
@@ -1850,19 +2031,29 @@ router.get("/notifications", async (req, res) => {
             .from("users")
             .select("id, auth_uid, email, display_name")
             .in("auth_uid", allUserIdentifiers),
-        ]);
+          enrollmentEmails.length > 0
+            ? supabase
+                .from("users")
+                .select("id, auth_uid, email, display_name")
+                .in("email", enrollmentEmails)
+            : Promise.resolve({ data: [], error: null }),
+          ]);
 
         if (usersByIdRes.error) throw usersByIdRes.error;
         if (usersByAuthUidRes.error) throw usersByAuthUidRes.error;
+        if (usersByEmailRes.error) throw usersByEmailRes.error;
 
         const mergedUsers = [
           ...(usersByIdRes.data || []),
           ...(usersByAuthUidRes.data || []),
+          ...(usersByEmailRes.data || []),
         ];
 
         mergedUsers.forEach((u) => {
           usersById[u.id] = u;
           if (u.auth_uid) usersByAuthUid[u.auth_uid] = u;
+          const normalizedEmail = String(u.email || "").trim().toLowerCase();
+          if (normalizedEmail) usersByEmail[normalizedEmail] = u;
         });
 
         const resolvedUserIds = [...new Set(mergedUsers.map((u) => u.id))];
@@ -1896,6 +2087,7 @@ router.get("/notifications", async (req, res) => {
         usersById[reqItem.user_id] || usersByAuthUid[reqItem.user_id] || null;
       if (!reqItem.user_id) return;
       const resolvedUserId = user?.id || reqItem.user_id;
+      const isSelfRequest = sameUserId(resolvedUserId, actingAdminId);
       const fallbackDisplayName =
         user?.display_name ||
         user?.email ||
@@ -1905,7 +2097,12 @@ router.get("/notifications", async (req, res) => {
         type: "request", // Generic request type for composer/admin requests
         userId: resolvedUserId,
         requestUserId: reqItem.user_id,
-        canApprove: Boolean(user?.id),
+        canApprove: Boolean(user?.id) && !isSelfRequest,
+        cannotApproveReason: !user?.id
+          ? "User profile missing. You can reject this stale request."
+          : isSelfRequest
+            ? "You cannot approve your own role request."
+            : null,
         email: user?.email || null,
         displayName: fallbackDisplayName,
         requestedRole: reqItem.requested_role,
@@ -1917,17 +2114,27 @@ router.get("/notifications", async (req, res) => {
     });
 
     // Add pending payment submissions as notifications
-    (paymentReqData || []).forEach((paymentReq) => {
-      const user = usersById[paymentReq.buyer_id] || null;
+    (paymentReqDataWithOwner || []).forEach((paymentReq) => {
+      const ownerUser =
+        usersById[paymentReq.__owner_user_id] ||
+        usersById[paymentReq.buyer_id] ||
+        usersByAuthUid[paymentReq.buyer_id] ||
+        null;
+      const ownerUserId = ownerUser?.id || paymentReq.__owner_user_id || null;
+      const isSelfPayment = sameUserId(ownerUserId, actingAdminId);
       items.push({
         id: `payment:${paymentReq.id}`,
         type: "payment_request",
         submissionId: paymentReq.id,
-        userId: paymentReq.buyer_id,
-        email: user?.email || null,
+        userId: ownerUserId || paymentReq.buyer_id,
+        canApprove: !isSelfPayment,
+        cannotApproveReason: isSelfPayment
+          ? "You cannot approve your own payment submission."
+          : null,
+        email: ownerUser?.email || null,
         displayName:
-          user?.display_name ||
-          user?.email ||
+          ownerUser?.display_name ||
+          ownerUser?.email ||
           `User (${String(paymentReq.buyer_id).slice(0, 8)}...)`,
         amount: Number(paymentReq.amount || 0),
         mpesaCode: paymentReq.mpesa_code || null,
@@ -1935,6 +2142,83 @@ router.get("/notifications", async (req, res) => {
         status: paymentReq.status,
         createdAt: paymentReq.submitted_at,
         created_at: paymentReq.submitted_at,
+      });
+    });
+
+    // Add pending enrollments as notifications.
+    (enrollmentReqData || []).forEach((enrollmentReq) => {
+      const linkedUser =
+        usersById[enrollmentReq.user_id] ||
+        usersByAuthUid[enrollmentReq.user_id] ||
+        usersByEmail[String(enrollmentReq.email || "").trim().toLowerCase()] ||
+        null;
+      const enrollmentOwnerUserId = linkedUser?.id || enrollmentReq.user_id || null;
+      const isSelfEnrollment =
+        sameUserId(enrollmentOwnerUserId, actingAdminId) ||
+        (!enrollmentOwnerUserId &&
+          sameEmail(enrollmentReq.email, actingAdminEmail));
+
+      items.push({
+        id: `enrollment:${enrollmentReq.id}`,
+        type: "enrollment_request",
+        enrollmentId: enrollmentReq.id,
+        userId: enrollmentOwnerUserId,
+        canApprove: !isSelfEnrollment,
+        cannotApproveReason: isSelfEnrollment
+          ? "You cannot admit your own enrollment request."
+          : null,
+        email: linkedUser?.email || enrollmentReq.email || null,
+        displayName:
+          linkedUser?.display_name ||
+          enrollmentReq.full_name ||
+          enrollmentReq.email ||
+          "Enrollment Request",
+        program: enrollmentReq.music_class || null,
+        skillLevel: enrollmentReq.skill_level || null,
+        status: enrollmentReq.status || "pending",
+        createdAt: enrollmentReq.created_at,
+        created_at: enrollmentReq.created_at,
+      });
+    });
+
+    // Add announcement broadcasts as notifications (deduplicated by sender+subject+minute).
+    const announcementGroups = new Map();
+    (announcementThreads || []).forEach((thread) => {
+      const senderUserId = thread.assigned_admin_user_id || null;
+      const subject = String(thread.subject || "Platform Announcement").trim();
+      const createdAt = thread.created_at || null;
+      const minuteSlot = createdAt ? String(createdAt).slice(0, 16) : "";
+      const key = `${senderUserId || "unknown"}|${subject}|${minuteSlot}`;
+      const group = announcementGroups.get(key) || {
+        id: thread.id,
+        senderUserId,
+        subject,
+        preview: thread.last_message_preview || "",
+        createdAt,
+        recipientCount: 0,
+      };
+      group.recipientCount += 1;
+      if (!group.createdAt || new Date(createdAt).getTime() > new Date(group.createdAt).getTime()) {
+        group.createdAt = createdAt;
+        group.id = thread.id;
+        group.preview = thread.last_message_preview || group.preview;
+      }
+      announcementGroups.set(key, group);
+    });
+
+    [...announcementGroups.values()].forEach((announcement) => {
+      const sender = announcement.senderUserId
+        ? usersById[announcement.senderUserId] || null
+        : null;
+      items.push({
+        id: `announcement:${announcement.id}`,
+        type: "announcement",
+        subject: announcement.subject || "Platform Announcement",
+        preview: announcement.preview || "",
+        displayName: sender?.display_name || sender?.email || "Admin",
+        recipientCount: Number(announcement.recipientCount || 0),
+        createdAt: announcement.createdAt,
+        created_at: announcement.createdAt,
       });
     });
 

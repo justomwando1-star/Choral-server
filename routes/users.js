@@ -81,7 +81,7 @@ router.get("/:id", async (req, res) => {
       .from("users")
       // select user profile
       .select(
-        `id, auth_uid, email, display_name, avatar_url, theme_settings, created_at`,
+        `id, auth_uid, email, display_name, phone, avatar_url, theme_settings, created_at`,
       )
       .eq("id", id)
       .maybeSingle();
@@ -108,7 +108,7 @@ router.get("/by-auth-uid/:authUid", async (req, res) => {
       .from("users")
       // select user profile
       .select(
-        `id, auth_uid, email, display_name, avatar_url, theme_settings, created_at`,
+        `id, auth_uid, email, display_name, phone, avatar_url, theme_settings, created_at`,
       )
       .eq("auth_uid", authUid)
       .maybeSingle();
@@ -129,14 +129,17 @@ router.get("/by-auth-uid/:authUid", async (req, res) => {
 // POST /api/users/ensure
 router.post("/ensure", async (req, res) => {
   try {
-    const { auth_uid, email, display_name, avatar_url, theme_settings } = req.body;
+    const { auth_uid, email, display_name, phone, avatar_url, theme_settings } =
+      req.body;
     if (!auth_uid) return res.status(400).json({ message: "auth_uid required" });
     const normalizedEmail = email ? String(email).trim().toLowerCase() : null;
     const normalizedAvatarUrl = normalizeAvatarUrl(avatar_url);
 
     const { data: existing, error: existingErr } = await supabaseAdmin
       .from("users")
-      .select("id, auth_uid, email, display_name, avatar_url, theme_settings")
+      .select(
+        "id, auth_uid, email, display_name, phone, avatar_url, theme_settings",
+      )
       .eq("auth_uid", auth_uid)
       .maybeSingle();
 
@@ -147,7 +150,9 @@ router.post("/ensure", async (req, res) => {
     if (normalizedEmail) {
       const { data: emailMatch, error: emailErr } = await supabaseAdmin
         .from("users")
-        .select("id, auth_uid, email, display_name, avatar_url, theme_settings")
+        .select(
+          "id, auth_uid, email, display_name, phone, avatar_url, theme_settings",
+        )
         .eq("email", normalizedEmail)
         .maybeSingle();
 
@@ -159,11 +164,14 @@ router.post("/ensure", async (req, res) => {
           .update({
             auth_uid,
             display_name: display_name || emailMatch.display_name || null,
+            phone: phone || emailMatch.phone || null,
             avatar_url: normalizedAvatarUrl || emailMatch.avatar_url || null,
             theme_settings: theme_settings || emailMatch.theme_settings || null,
           })
           .eq("id", emailMatch.id)
-          .select("id, auth_uid, email, display_name, avatar_url, theme_settings")
+          .select(
+            "id, auth_uid, email, display_name, phone, avatar_url, theme_settings",
+          )
           .maybeSingle();
 
         if (updateErr) throw updateErr;
@@ -177,6 +185,7 @@ router.post("/ensure", async (req, res) => {
         auth_uid,
         email: normalizedEmail || null,
         display_name: display_name || null,
+        phone: phone || null,
         avatar_url: normalizedAvatarUrl || null,
         theme_settings:
           theme_settings && typeof theme_settings === "object"
@@ -191,7 +200,9 @@ router.post("/ensure", async (req, res) => {
       if (createErr.code === "23505") {
         const { data: conflictRow, error: conflictErr } = await supabaseAdmin
           .from("users")
-          .select("id, auth_uid, email, display_name, avatar_url, theme_settings")
+          .select(
+            "id, auth_uid, email, display_name, phone, avatar_url, theme_settings",
+          )
           .or(
             normalizedEmail
               ? `auth_uid.eq.${auth_uid},email.eq.${normalizedEmail}`
@@ -212,11 +223,14 @@ router.post("/ensure", async (req, res) => {
             .update({
               auth_uid,
               display_name: display_name || conflictRow.display_name || null,
+              phone: phone || conflictRow.phone || null,
               avatar_url: normalizedAvatarUrl || conflictRow.avatar_url || null,
               theme_settings: theme_settings || conflictRow.theme_settings || null,
             })
             .eq("id", conflictRow.id)
-            .select("id, auth_uid, email, display_name, avatar_url, theme_settings")
+            .select(
+              "id, auth_uid, email, display_name, phone, avatar_url, theme_settings",
+            )
             .maybeSingle();
           if (remapErr) throw remapErr;
           if (remapped) return res.json(withNormalizedAvatar(remapped));
