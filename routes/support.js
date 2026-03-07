@@ -20,6 +20,8 @@ const TICKET_REJECTED_MESSAGE =
   "Your ticket was rejected by all available admins. Please open a new ticket if you still need help.";
 const TICKET_EXPIRED_MESSAGE =
   "This ticket expired after 30 days. Please open a new ticket if your issue is still unresolved.";
+const ANNOUNCEMENT_ROLE_OPTIONS = ["student", "buyer", "composer", "admin"];
+const AI_DRAFT_USE_CASES = new Set(["support", "message", "announcement"]);
 
 function normalizeText(value, max = 2000) {
   return String(value || "")
@@ -33,12 +35,139 @@ function parseLimit(raw, fallback = 50, max = 500) {
   return Math.min(Math.floor(n), max);
 }
 
+function parseJsonObject(content) {
+  if (!content) return null;
+
+  try {
+    return JSON.parse(content);
+  } catch {
+    const start = content.indexOf("{");
+    const end = content.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      try {
+        return JSON.parse(content.slice(start, end + 1));
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+function normalizeAnnouncementRoles(rawRoles) {
+  const parsedRoles = Array.isArray(rawRoles)
+    ? rawRoles
+    : String(rawRoles || "")
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter(Boolean);
+
+  return [
+    ...new Set(
+      parsedRoles
+        .map((role) => String(role || "").trim().toLowerCase())
+        .filter((role) => ANNOUNCEMENT_ROLE_OPTIONS.includes(role)),
+    ),
+  ];
+}
+
+function normalizeAiDraftUseCase(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (AI_DRAFT_USE_CASES.has(normalized)) {
+    return normalized;
+  }
+  return "message";
+}
+
 function isOpenTicketStatus(status) {
   return OPEN_TICKET_STATUSES.includes(String(status || "").toLowerCase());
 }
 
 function isClosedTicketStatus(status) {
   return CLOSED_TICKET_STATUSES.has(String(status || "").toLowerCase());
+}
+
+async function generateProfessionalDraft({
+  useCase,
+  subject,
+  message,
+  audienceRoles = [],
+  context = "",
+}) {
+  const openAiKey = String(process.env.OPENAI_API_KEY || "").trim();
+  if (!openAiKey) {
+    const error = new Error(
+      "AI assistant is not configured. Set OPENAI_API_KEY on the backend.",
+    );
+    error.statusCode = 503;
+    throw error;
+  }
+
+  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const normalizedUseCase = normalizeAiDraftUseCase(useCase);
+  const promptPayload = {
+    useCase: normalizedUseCase,
+    audienceRoles: normalizeAnnouncementRoles(audienceRoles),
+    context: normalizeText(context, 160) || null,
+    subject: normalizeText(subject, 160) || null,
+    message: normalizeText(message, 4000),
+  };
+
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${openAiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.25,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You rewrite operational platform messages in a clear professional tone. Return JSON only with keys: subject, message. Keep message concise, respectful, and action-oriented. Do not use markdown.",
+        },
+        {
+          role: "user",
+          content: JSON.stringify(promptPayload),
+        },
+      ],
+      max_tokens: 500,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    const error = new Error(
+      `AI draft generation failed (${response.status}): ${errorBody}`,
+    );
+    error.statusCode = response.status >= 500 ? 502 : response.status;
+    throw error;
+  }
+
+  const payload = await response.json();
+  const content = payload?.choices?.[0]?.message?.content;
+  const parsed = parseJsonObject(content);
+
+  const draftSubject = normalizeText(parsed?.subject || promptPayload.subject, 160);
+  const draftMessage = normalizeText(parsed?.message || promptPayload.message, 4000);
+
+  if (!draftMessage) {
+    const error = new Error("AI draft returned an empty message");
+    error.statusCode = 502;
+    throw error;
+  }
+
+  return {
+    model,
+    useCase: normalizedUseCase,
+    draft: {
+      subject: draftSubject,
+      message: draftMessage,
+    },
+  };
 }
 
 function isMissingSupportChatTablesError(err) {
@@ -382,6 +511,101 @@ async function loadMemberThreadsForUser(userId, limit = 100) {
   );
 }
 
+async function resolveAnnouncementRecipients(targetRoles, senderUserId = null) {
+  const normalizedTargetRoles = normalizeAnnouncementRoles(targetRoles);
+  if (normalizedTargetRoles.length === 0) return [];
+
+  const { data: users, error: usersErr } = await supabaseAdmin
+    .from("users")
+    .select("id, email, display_name, avatar_url, is_active")
+    .neq("is_active", false)
+    .limit(10000);
+  if (usersErr) throw usersErr;
+
+  const activeUsers = (users || []).filter((user) => user?.id);
+  if (activeUsers.length === 0) return [];
+
+  const userIds = activeUsers.map((user) => user.id);
+  const rolesByUserId = new Map(userIds.map((id) => [id, new Set()]));
+
+  const addRole = (userId, roleName) => {
+    const normalizedRole = String(roleName || "").trim().toLowerCase();
+    if (!normalizedRole) return;
+    const roleSet = rolesByUserId.get(userId);
+    if (!roleSet) return;
+    roleSet.add(normalizedRole);
+  };
+
+  const { data: roleRows, error: roleRowsErr } = await supabaseAdmin
+    .from("user_roles")
+    .select("user_id, roles(name)")
+    .in("user_id", userIds);
+  if (roleRowsErr) throw roleRowsErr;
+  (roleRows || []).forEach((row) => {
+    const roleName = String(row?.roles?.name || "").toLowerCase();
+    if (row?.user_id && roleName) {
+      addRole(row.user_id, roleName);
+    }
+  });
+
+  const { data: composerRows, error: composerErr } = await supabaseAdmin
+    .from("composers")
+    .select("user_id")
+    .in("user_id", userIds);
+  if (!composerErr) {
+    (composerRows || []).forEach((row) => {
+      if (row?.user_id) addRole(row.user_id, "composer");
+    });
+  }
+
+  const userByEmail = new Map(
+    activeUsers
+      .map((user) => [String(user?.email || "").trim().toLowerCase(), user.id])
+      .filter(([email]) => Boolean(email)),
+  );
+
+  const { data: adminEmailRows, error: adminEmailErr } = await supabaseAdmin
+    .from("admin_emails")
+    .select("email")
+    .eq("is_active", true);
+  if (!adminEmailErr) {
+    (adminEmailRows || []).forEach((row) => {
+      const userId = userByEmail.get(String(row?.email || "").trim().toLowerCase());
+      if (userId) addRole(userId, "admin");
+    });
+  }
+
+  const { data: enrollmentRows, error: enrollmentErr } = await supabaseAdmin
+    .from("enrollments")
+    .select("user_id, email, status")
+    .in("status", ["pending", "admitted"]);
+  if (!enrollmentErr) {
+    (enrollmentRows || []).forEach((row) => {
+      let userId = row?.user_id || null;
+      if (!userId) {
+        userId = userByEmail.get(String(row?.email || "").trim().toLowerCase()) || null;
+      }
+      if (userId) addRole(userId, "student");
+    });
+  }
+
+  activeUsers.forEach((user) => {
+    const roleSet = rolesByUserId.get(user.id);
+    if (!roleSet || roleSet.size === 0) {
+      addRole(user.id, "buyer");
+    }
+  });
+
+  const targetRoleSet = new Set(normalizedTargetRoles);
+  return activeUsers
+    .filter((user) => !senderUserId || user.id !== senderUserId)
+    .map((user) => ({
+      ...withNormalizedAvatar(user),
+      roles: [...(rolesByUserId.get(user.id) || [])],
+    }))
+    .filter((user) => user.roles.some((role) => targetRoleSet.has(role)));
+}
+
 function normalizeAdminThreadType(value) {
   const normalized = normalizeText(value, 24).toLowerCase();
   if (
@@ -407,6 +631,158 @@ function defaultAdminThreadContext(threadType) {
 }
 
 router.use(verifySupabaseToken);
+
+router.post("/ai/draft", async (req, res) => {
+  try {
+    const authUid = req.authUid;
+    if (!authUid) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const user = await resolveDbUser(authUid);
+    if (!user?.id) {
+      return res.status(404).json({ message: "User profile not found" });
+    }
+
+    const normalizedMessage = normalizeText(
+      req.body?.message || req.body?.text,
+      4000,
+    );
+    if (!normalizedMessage) {
+      return res.status(400).json({ message: "message is required" });
+    }
+
+    const useCase = normalizeAiDraftUseCase(req.body?.useCase);
+    const audienceRoles = normalizeAnnouncementRoles(
+      req.body?.audienceRoles || req.body?.roles,
+    );
+    const subject = normalizeText(req.body?.subject, 160);
+    const context = normalizeText(req.body?.context, 160);
+
+    const draftResult = await generateProfessionalDraft({
+      useCase,
+      subject,
+      message: normalizedMessage,
+      audienceRoles,
+      context,
+    });
+
+    return res.json({
+      success: true,
+      ...draftResult,
+    });
+  } catch (err) {
+    console.error("[support-ai-draft] Error:", err);
+    const statusCode = Number(err?.statusCode || 500);
+    return res.status(statusCode).json({
+      message: err?.message || "Failed to generate AI draft",
+      error: err?.message || "UNKNOWN_ERROR",
+    });
+  }
+});
+
+router.post("/admin/announcements", adminOnly, async (req, res) => {
+  try {
+    await expireOverdueTickets();
+
+    const adminUser = await resolveDbUser(req.authUid);
+    if (!adminUser?.id) {
+      return res.status(404).json({ message: "Admin profile not found" });
+    }
+
+    const targetRoles = normalizeAnnouncementRoles(
+      req.body?.targetRoles || req.body?.roles,
+    );
+    if (targetRoles.length === 0) {
+      return res.status(400).json({
+        message:
+          "At least one target role is required. Use student, buyer, composer, or admin.",
+      });
+    }
+
+    const normalizedMessage = normalizeText(req.body?.message, 4000);
+    if (!normalizedMessage) {
+      return res.status(400).json({ message: "Announcement message is required" });
+    }
+
+    const normalizedSubject =
+      normalizeText(req.body?.subject, 160) || "Platform Announcement";
+    const normalizedContext =
+      normalizeText(req.body?.context, 120) || "admin-announcement";
+
+    const recipients = await resolveAnnouncementRecipients(
+      targetRoles,
+      adminUser.id,
+    );
+    if (recipients.length === 0) {
+      return res.status(404).json({
+        message: "No active users match the selected target roles",
+      });
+    }
+
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const expiresAtIso = new Date(
+      now.getTime() + TICKET_LIFETIME_DAYS * 24 * 60 * 60 * 1000,
+    ).toISOString();
+
+    const threadRows = recipients.map((recipient) => ({
+      requester_user_id: recipient.id,
+      subject: normalizedSubject,
+      context: normalizedContext,
+      status: "active",
+      assigned_admin_user_id: adminUser.id,
+      assigned_at: nowIso,
+      expires_at: expiresAtIso,
+      is_admin_unread: false,
+      is_user_unread: true,
+      last_message_preview: normalizedMessage.slice(0, 500),
+      last_sender_role: "admin",
+      last_message_at: nowIso,
+      created_at: nowIso,
+      updated_at: nowIso,
+    }));
+
+    const { data: createdThreads, error: threadErr } = await supabaseAdmin
+      .from("support_chat_threads")
+      .insert(threadRows)
+      .select("id, requester_user_id");
+    if (threadErr) throw threadErr;
+
+    const messageRows = (createdThreads || []).map((thread) => ({
+      thread_id: thread.id,
+      sender_user_id: adminUser.id,
+      sender_role: "admin",
+      message: normalizedMessage,
+      created_at: nowIso,
+    }));
+
+    const { error: messageErr } = await supabaseAdmin
+      .from("support_chat_messages")
+      .insert(messageRows);
+    if (messageErr) throw messageErr;
+
+    return res.status(201).json({
+      success: true,
+      recipientCount: recipients.length,
+      targetRoles,
+      createdThreadIds: (createdThreads || []).map((thread) => thread.id),
+      message: "Announcement sent",
+    });
+  } catch (err) {
+    console.error("[support-admin-announcement] Error:", err);
+
+    if (isMissingSupportChatTablesError(err)) {
+      return missingMigrationResponse(res);
+    }
+
+    return res.status(500).json({
+      message: "Failed to send announcement",
+      error: err?.message || "UNKNOWN_ERROR",
+    });
+  }
+});
+
 // Backward-compatible issue endpoint.
 router.post("/issues", async (req, res) => {
   try {

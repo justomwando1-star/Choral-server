@@ -36,6 +36,38 @@ const VOICE_PART_OPTIONS = [
   "Soprano II",
 ];
 const PRICE_CURRENCY_DEFAULT = "USD";
+const CURRENCY_ALIAS_MAP = {
+  USD: "USD",
+  US: "USD",
+  DOLLAR: "USD",
+  DOLLARS: "USD",
+  "$": "USD",
+  US$: "USD",
+  KES: "KES",
+  KSH: "KES",
+  KSHS: "KES",
+  SHILLING: "KES",
+  SHILLINGS: "KES",
+  "KSH.": "KES",
+  "KSHS.": "KES",
+  EUR: "EUR",
+  EURO: "EUR",
+  EUROS: "EUR",
+  "€": "EUR",
+  GBP: "GBP",
+  POUND: "GBP",
+  POUNDS: "GBP",
+  "£": "GBP",
+  UGX: "UGX",
+  TZS: "TZS",
+  RWF: "RWF",
+  NGN: "NGN",
+  ZAR: "ZAR",
+  CAD: "CAD",
+  AUD: "AUD",
+  INR: "INR",
+  JPY: "JPY",
+};
 
 function isMissingPriceCurrencyColumnError(err) {
   const code = String(err?.code || "").toUpperCase();
@@ -54,6 +86,137 @@ function normalizePriceCurrency(value) {
     .toUpperCase();
   if (!trimmed) return PRICE_CURRENCY_DEFAULT;
   return trimmed.slice(0, 16);
+}
+
+function normalizeCurrencyCode(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toUpperCase();
+  if (!normalized) return "";
+  return CURRENCY_ALIAS_MAP[normalized] || normalized.slice(0, 8);
+}
+
+function sanitizePriceInput(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+}
+
+function parseAmountLoose(value) {
+  if (value === null || value === undefined) return NaN;
+  if (typeof value === "number") return Number.isFinite(value) ? value : NaN;
+  const text = String(value || "")
+    .replace(/,/g, "")
+    .trim();
+  if (!text) return NaN;
+  const match = text.match(/-?\d+(\.\d+)?/);
+  if (!match) return NaN;
+  const amount = Number.parseFloat(match[0]);
+  return Number.isFinite(amount) ? amount : NaN;
+}
+
+function detectCurrencyFromText(value) {
+  const text = String(value || "")
+    .toUpperCase()
+    .trim();
+  if (!text) return "";
+
+  if (text.includes("KSH") || text.includes("KES")) return "KES";
+  if (text.includes("UGX")) return "UGX";
+  if (text.includes("TZS")) return "TZS";
+  if (text.includes("RWF")) return "RWF";
+  if (text.includes("NGN")) return "NGN";
+  if (text.includes("ZAR")) return "ZAR";
+  if (text.includes("EUR") || text.includes("EURO") || text.includes("€")) {
+    return "EUR";
+  }
+  if (text.includes("GBP") || text.includes("POUND") || text.includes("£")) {
+    return "GBP";
+  }
+  if (text.includes("USD") || text.includes("US$") || text.includes("$")) {
+    return "USD";
+  }
+  return "";
+}
+
+async function detectPriceWithAI({ priceInput, currencyHint, amountHint }) {
+  const openAiKey = String(process.env.OPENAI_API_KEY || "").trim();
+  if (!openAiKey) return null;
+
+  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${openAiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Extract price and currency from user input. Return JSON with keys: amount (number), currencyCode (3-letter ISO code), confidence (0 to 1).",
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            priceInput: sanitizePriceInput(priceInput),
+            currencyHint: sanitizePriceInput(currencyHint),
+            amountHint:
+              Number.isFinite(Number(amountHint)) && Number(amountHint) > 0
+                ? Number(amountHint)
+                : null,
+          }),
+        },
+      ],
+      max_tokens: 220,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`OpenAI price parse failed: ${response.status} ${errorBody}`);
+  }
+
+  const payload = await response.json();
+  const content = payload?.choices?.[0]?.message?.content || "";
+  let parsed = null;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    const start = content.indexOf("{");
+    const end = content.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      parsed = JSON.parse(content.slice(start, end + 1));
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object") return null;
+  return {
+    amount: parseAmountLoose(parsed.amount),
+    currencyCode: normalizeCurrencyCode(parsed.currencyCode),
+    confidence: Number(parsed.confidence || 0),
+  };
+}
+
+async function fetchRateToUsd(currencyCode) {
+  if (!currencyCode || currencyCode === "USD") return 1;
+  const endpoint = `https://open.er-api.com/v6/latest/${encodeURIComponent(currencyCode)}`;
+  const response = await fetch(endpoint);
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Exchange rate lookup failed (${response.status}): ${body}`);
+  }
+  const payload = await response.json();
+  const rate = Number(payload?.rates?.USD);
+  if (!Number.isFinite(rate) || rate <= 0) {
+    throw new Error("Exchange rate provider returned invalid USD rate");
+  }
+  return rate;
 }
 
 function parseLimit(raw, fallback = 120, max = 500) {
@@ -260,6 +423,77 @@ async function analyzeMetadataWithAI(rawText) {
     return null;
   }
 }
+
+router.post("/price-to-usd", verifySupabaseToken, async (req, res) => {
+  try {
+    const priceInput = sanitizePriceInput(req.body?.priceInput || req.body?.price);
+    const currencyHint = sanitizePriceInput(req.body?.currencyHint || req.body?.currency);
+    const amountHint = parseAmountLoose(req.body?.amount);
+
+    if (!priceInput && !Number.isFinite(amountHint)) {
+      return res.status(400).json({
+        message: "Provide priceInput (or amount) to convert.",
+      });
+    }
+
+    let aiResult = null;
+    try {
+      aiResult = await detectPriceWithAI({
+        priceInput,
+        currencyHint,
+        amountHint,
+      });
+    } catch (error) {
+      console.warn("[price-to-usd] AI detection failed, falling back:", error?.message || error);
+    }
+
+    const fallbackCurrency =
+      normalizeCurrencyCode(currencyHint) || detectCurrencyFromText(priceInput);
+    const detectedCurrency =
+      normalizeCurrencyCode(aiResult?.currencyCode) || fallbackCurrency;
+    if (!detectedCurrency) {
+      return res.status(400).json({
+        message:
+          "Could not detect currency. Add currency code like USD, KES, EUR, GBP.",
+      });
+    }
+
+    const detectedAmount = Number.isFinite(aiResult?.amount)
+      ? Number(aiResult.amount)
+      : Number.isFinite(amountHint)
+        ? Number(amountHint)
+        : parseAmountLoose(priceInput);
+    if (!Number.isFinite(detectedAmount) || detectedAmount <= 0) {
+      return res.status(400).json({
+        message: "Could not detect a valid positive amount.",
+      });
+    }
+
+    const rateToUsd = await fetchRateToUsd(detectedCurrency);
+    const usdAmount = Number((detectedAmount * rateToUsd).toFixed(2));
+
+    return res.json({
+      success: true,
+      detectedBy: aiResult ? "ai" : "heuristic",
+      aiConfidence:
+        Number.isFinite(Number(aiResult?.confidence)) && Number(aiResult.confidence) > 0
+          ? Number(aiResult.confidence)
+          : null,
+      originalAmount: Number(detectedAmount.toFixed(2)),
+      originalCurrency: detectedCurrency,
+      rateToUsd,
+      usdAmount,
+      usdCurrency: "USD",
+      convertedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("[price-to-usd] Error:", err);
+    return res.status(500).json({
+      message: "Failed to convert price to USD",
+      error: err?.message || "UNKNOWN_ERROR",
+    });
+  }
+});
 
 router.post(
   "/analyze-pdf",
