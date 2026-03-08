@@ -40,6 +40,39 @@ function isTransientSupabaseError(err) {
   );
 }
 
+function isMissingComposerActivationColumnError(err) {
+  const code = String(err?.code || "").toUpperCase();
+  const message = String(err?.message || "").toLowerCase();
+  return (
+    code === "42703" ||
+    code === "PGRST204" ||
+    code === "PGRST205" ||
+    message.includes("is_active")
+  );
+}
+
+async function hasActiveComposerProfile(userId) {
+  let { data, error } = await supabaseAdmin
+    .from("composers")
+    .select("id, is_active")
+    .eq("user_id", userId)
+    .eq("is_active", true)
+    .maybeSingle();
+
+  if (error && isMissingComposerActivationColumnError(error)) {
+    const fallback = await supabaseAdmin
+      .from("composers")
+      .select("id")
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (fallback.error) throw fallback.error;
+    return Boolean(fallback.data);
+  }
+
+  if (error) throw error;
+  return Boolean(data);
+}
+
 // GET /api/user/roles/:authUid
 router.get("/roles/:authUid", async (req, res) => {
   try {
@@ -89,15 +122,8 @@ router.get("/roles/:authUid", async (req, res) => {
 
     // check composers table
     try {
-      const { data: composerData, error: composerErr } = await supabaseAdmin
-        .from("composers")
-        .select("id")
-        .eq("user_id", userData.id)
-        .maybeSingle();
-      if (composerErr) {
-        if (!isMissingSchemaObjectError(composerErr)) throw composerErr;
-        console.warn("[roles] composers table unavailable:", composerErr.message);
-      } else if (composerData) {
+      const composerActive = await hasActiveComposerProfile(userData.id);
+      if (composerActive) {
         addRole("composer");
       }
     } catch (composerLookupErr) {

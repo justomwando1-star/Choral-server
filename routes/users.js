@@ -17,6 +17,39 @@ const ADMIN_IDENTIFIERS = new Set(
     .filter(Boolean),
 );
 
+function isMissingComposerActivationColumnError(err) {
+  const code = String(err?.code || "").toUpperCase();
+  const message = String(err?.message || "").toLowerCase();
+  return (
+    code === "42703" ||
+    code === "PGRST204" ||
+    code === "PGRST205" ||
+    message.includes("is_active")
+  );
+}
+
+async function hasActiveComposerProfile(userId) {
+  let { data, error } = await supabaseAdmin
+    .from("composers")
+    .select("id, is_active")
+    .eq("user_id", userId)
+    .eq("is_active", true)
+    .maybeSingle();
+
+  if (error && isMissingComposerActivationColumnError(error)) {
+    const fallback = await supabaseAdmin
+      .from("composers")
+      .select("id")
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (fallback.error) throw fallback.error;
+    return Boolean(fallback.data);
+  }
+
+  if (error) throw error;
+  return Boolean(data);
+}
+
 async function prepareUserResponse(userRow) {
   return await refreshAvatarUrl(withNormalizedAvatar(userRow));
 }
@@ -48,12 +81,8 @@ async function resolveUserRoles(userRow) {
   });
 
   // Safety check for composer legacy compatibility.
-  const { data: composer } = await supabaseAdmin
-    .from("composers")
-    .select("id")
-    .eq("user_id", userId)
-    .maybeSingle();
-  if (composer && !roles.includes("composer")) roles.push("composer");
+  const composerActive = await hasActiveComposerProfile(userId);
+  if (composerActive && !roles.includes("composer")) roles.push("composer");
 
   // Admin via env allowlist / admin_emails fallback.
   if (normalizedEmail && ADMIN_IDENTIFIERS.has(normalizedEmail)) {

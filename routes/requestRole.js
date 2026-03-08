@@ -20,6 +20,39 @@ const ADMIN_IDENTIFIERS = new Set(
     .filter(Boolean),
 );
 
+function isMissingComposerActivationColumnError(err) {
+  const code = String(err?.code || "").toUpperCase();
+  const message = String(err?.message || "").toLowerCase();
+  return (
+    code === "42703" ||
+    code === "PGRST204" ||
+    code === "PGRST205" ||
+    message.includes("is_active")
+  );
+}
+
+async function hasActiveComposerProfile(userId) {
+  let { data, error } = await supabaseAdmin
+    .from("composers")
+    .select("id, is_active")
+    .eq("user_id", userId)
+    .eq("is_active", true)
+    .maybeSingle();
+
+  if (error && isMissingComposerActivationColumnError(error)) {
+    const fallback = await supabaseAdmin
+      .from("composers")
+      .select("id")
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (fallback.error) throw fallback.error;
+    return Boolean(fallback.data);
+  }
+
+  if (error) throw error;
+  return Boolean(data);
+}
+
 async function resolveUserRoles(userId, email) {
   const roles = ["buyer"];
 
@@ -34,13 +67,8 @@ async function resolveUserRoles(userId, email) {
     if (roleName && !roles.includes(roleName)) roles.push(roleName);
   });
 
-  const { data: composerRow, error: composerErr } = await supabaseAdmin
-    .from("composers")
-    .select("id")
-    .eq("user_id", userId)
-    .maybeSingle();
-  if (composerErr) throw composerErr;
-  if (composerRow && !roles.includes("composer")) roles.push("composer");
+  const composerActive = await hasActiveComposerProfile(userId);
+  if (composerActive && !roles.includes("composer")) roles.push("composer");
 
   const normalizedEmail = String(email || "")
     .trim()

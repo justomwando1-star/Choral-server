@@ -15,6 +15,17 @@ import {
 } from "../utils/registrationPayments.js";
 
 const router = express.Router();
+const ADMIN_IDENTIFIERS = new Set(
+  String(process.env.ADMIN_IDENTIFIERS || "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean),
+);
+const ROLE_PRIORITY = {
+  buyer: 1,
+  composer: 2,
+  admin: 3,
+};
 
 // Protect all admin routes
 router.use(verifySupabaseToken, adminOnly);
@@ -71,6 +82,17 @@ function isMissingSupportChatTablesError(err) {
   );
 }
 
+function isMissingComposerActivationColumnError(err) {
+  const code = String(err?.code || "").toUpperCase();
+  const message = String(err?.message || "").toLowerCase();
+  return (
+    code === "42703" ||
+    code === "PGRST204" ||
+    code === "PGRST205" ||
+    message.includes("is_active")
+  );
+}
+
 function missingEnrollmentsResponse(res) {
   return res.status(500).json({
     message:
@@ -82,6 +104,73 @@ function parseLimit(raw, fallback = 200, max = 1000) {
   const n = Number(raw);
   if (!Number.isFinite(n) || n <= 0) return fallback;
   return Math.min(Math.floor(n), max);
+}
+
+async function fetchComposerProfiles(userIds = []) {
+  const normalizedUserIds = [...new Set((userIds || []).filter(Boolean))];
+  let query = supabase.from("composers").select("id, user_id, is_active");
+  if (normalizedUserIds.length > 0) {
+    query = query.in("user_id", normalizedUserIds);
+  }
+
+  const { data, error } = await query;
+  if (!error) {
+    return {
+      rows: data || [],
+      activationColumnMissing: false,
+    };
+  }
+
+  if (!isMissingComposerActivationColumnError(error)) {
+    throw error;
+  }
+
+  let fallbackQuery = supabase.from("composers").select("id, user_id");
+  if (normalizedUserIds.length > 0) {
+    fallbackQuery = fallbackQuery.in("user_id", normalizedUserIds);
+  }
+
+  const fallback = await fallbackQuery;
+  if (fallback.error) throw fallback.error;
+
+  return {
+    rows: (fallback.data || []).map((row) => ({ ...row, is_active: true })),
+    activationColumnMissing: true,
+  };
+}
+
+async function fetchComposerProfileByUserId(userId) {
+  const { rows, activationColumnMissing } = await fetchComposerProfiles([userId]);
+  return {
+    profile: rows[0] || null,
+    activationColumnMissing,
+  };
+}
+
+async function resolveRoleId(roleName) {
+  const normalizedRole = String(roleName || "").trim().toLowerCase();
+  if (!normalizedRole) return null;
+
+  const { data: roleRow, error } = await supabase
+    .from("roles")
+    .select("id")
+    .eq("name", normalizedRole)
+    .maybeSingle();
+  if (error) throw error;
+  return roleRow?.id || null;
+}
+
+async function removeUserRoleAssignment(userId, roleName) {
+  const roleId = await resolveRoleId(roleName);
+  if (!roleId) return 0;
+
+  const { error, count } = await supabase
+    .from("user_roles")
+    .delete({ count: "exact" })
+    .eq("user_id", userId)
+    .eq("role_id", roleId);
+  if (error) throw error;
+  return Number(count || 0);
 }
 
 async function resolveDbUser(userIdentifier) {
@@ -409,8 +498,62 @@ router.get("/users", async (req, res) => {
       ),
     );
 
+    const userIds = refreshedUsers.map((user) => user.id).filter(Boolean);
+    const [composerProfiles, activeAdminEmailsRes] = await Promise.all([
+      fetchComposerProfiles(userIds),
+      supabase
+        .from("admin_emails")
+        .select("email")
+        .eq("is_active", true),
+    ]);
+    if (activeAdminEmailsRes.error) throw activeAdminEmailsRes.error;
+
+    const explicitRolesByUserId = {};
+    (userRoles || []).forEach((row) => {
+      const roleName = String(row?.roles?.name || "")
+        .trim()
+        .toLowerCase();
+      if (!row?.user_id || !roleName) return;
+      if (!explicitRolesByUserId[row.user_id]) {
+        explicitRolesByUserId[row.user_id] = new Set(["buyer"]);
+      }
+      explicitRolesByUserId[row.user_id].add(roleName);
+    });
+
+    const composerUserIds = new Set(
+      (composerProfiles.rows || [])
+        .filter((row) => row?.user_id && row?.is_active !== false)
+        .map((row) => row.user_id),
+    );
+    const activeAdminEmails = new Set(
+      (activeAdminEmailsRes.data || [])
+        .map((row) => String(row?.email || "").trim().toLowerCase())
+        .filter(Boolean),
+    );
+
+    const usersWithEffectiveRoles = refreshedUsers.map((user) => {
+      const roles = explicitRolesByUserId[user.id] || new Set(["buyer"]);
+      if (composerUserIds.has(user.id)) roles.add("composer");
+
+      const normalizedEmail = String(user?.email || "").trim().toLowerCase();
+      if (
+        normalizedEmail &&
+        (ADMIN_IDENTIFIERS.has(normalizedEmail) ||
+          activeAdminEmails.has(normalizedEmail))
+      ) {
+        roles.add("admin");
+      }
+
+      return {
+        ...user,
+        roles: [...roles].sort(
+          (a, b) => (ROLE_PRIORITY[b] || 0) - (ROLE_PRIORITY[a] || 0),
+        ),
+      };
+    });
+
     return res.json({
-      users: refreshedUsers,
+      users: usersWithEffectiveRoles,
       userRoles: userRoles || [],
     });
   } catch (err) {
@@ -1488,16 +1631,76 @@ router.post("/users/:userId/promote-composer", async (req, res) => {
         e?.message || e,
       );
     }
-    const { data: existingComposer } = await supabase
-      .from("composers")
-      .select("id")
-      .eq("user_id", userId)
-      .maybeSingle();
-    if (!existingComposer)
-      await supabase.from("composers").insert([{ user_id: userId }]);
+    const { profile: existingComposer, activationColumnMissing } =
+      await fetchComposerProfileByUserId(userId);
+
+    if (existingComposer) {
+      if (!activationColumnMissing && existingComposer.is_active === false) {
+        const { error: reactivateComposerErr } = await supabase
+          .from("composers")
+          .update({
+            is_active: true,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", existingComposer.id);
+        if (reactivateComposerErr) throw reactivateComposerErr;
+      }
+    } else {
+      const { error: composerInsertErr } = await supabase
+        .from("composers")
+        .insert([{ user_id: userId }]);
+      if (
+        composerInsertErr &&
+        String(composerInsertErr.code || "").toUpperCase() !== "23505"
+      ) {
+        throw composerInsertErr;
+      }
+    }
     return res.json({ success: true, message: "User promoted to composer" });
   } catch (err) {
     console.error("[admin-promote-composer] Error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/users/:userId/demote-composer", async (req, res) => {
+  try {
+    const { userId: userIdentifier } = req.params;
+    const targetUser = await resolveDbUser(userIdentifier);
+    if (!targetUser) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const { profile: composerProfile, activationColumnMissing } =
+      await fetchComposerProfileByUserId(targetUser.id);
+
+    if (composerProfile && activationColumnMissing) {
+      return res.status(500).json({
+        message:
+          "Composer activation column is missing. Run migration 027_add_composers_is_active.sql, then retry.",
+      });
+    }
+
+    await removeUserRoleAssignment(targetUser.id, "composer");
+
+    if (composerProfile?.id) {
+      const { error: deactivateComposerErr } = await supabase
+        .from("composers")
+        .update({
+          is_active: false,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", composerProfile.id);
+      if (deactivateComposerErr) throw deactivateComposerErr;
+    }
+
+    return res.json({
+      success: true,
+      message: "Composer access removed",
+      userId: targetUser.id,
+    });
+  } catch (err) {
+    console.error("[admin-demote-composer] Error:", err);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -1554,6 +1757,59 @@ router.post("/users/:userId/promote-admin", async (req, res) => {
     return res.json({ success: true, message: "User promoted to admin" });
   } catch (err) {
     console.error("[admin-promote-admin] Error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.post("/users/:userId/demote-admin", async (req, res) => {
+  try {
+    const { userId: userIdentifier } = req.params;
+    const actingAdmin = await resolveDbUser(req.authUid);
+    if (!actingAdmin?.id) {
+      return res.status(404).json({ error: "Admin user not found" });
+    }
+
+    const targetUser = await resolveDbUser(userIdentifier);
+    if (!targetUser) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    if (sameUserId(targetUser.id, actingAdmin.id)) {
+      return res.status(403).json({
+        error: "You cannot remove your own admin access.",
+      });
+    }
+
+    const normalizedTargetEmail = String(targetUser.email || "")
+      .trim()
+      .toLowerCase();
+    if (
+      normalizedTargetEmail &&
+      ADMIN_IDENTIFIERS.has(normalizedTargetEmail)
+    ) {
+      return res.status(403).json({
+        error: "This admin is protected by the server allowlist and cannot be depromoted here.",
+      });
+    }
+
+    await removeUserRoleAssignment(targetUser.id, "admin");
+
+    if (normalizedTargetEmail) {
+      const { error: deactivateAdminEmailErr } = await supabase
+        .from("admin_emails")
+        .update({ is_active: false })
+        .ilike("email", normalizedTargetEmail)
+        .eq("is_active", true);
+      if (deactivateAdminEmailErr) throw deactivateAdminEmailErr;
+    }
+
+    return res.json({
+      success: true,
+      message: "Admin access removed",
+      userId: targetUser.id,
+    });
+  } catch (err) {
+    console.error("[admin-demote-admin] Error:", err);
     return res.status(500).json({ error: err.message });
   }
 });
