@@ -40,6 +40,17 @@ function isMissingRecommendationRpcError(err) {
   );
 }
 
+function isMissingPriceCurrencyColumnError(err) {
+  const code = String(err?.code || "").toUpperCase();
+  const message = String(err?.message || "").toLowerCase();
+  return (
+    code === "42703" ||
+    code === "PGRST204" ||
+    code === "PGRST205" ||
+    message.includes("price_currency")
+  );
+}
+
 function parseSafeLimit(raw, fallback = 20, max = 50) {
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
@@ -160,7 +171,24 @@ async function fetchFallbackRecommendations(userId, limit) {
     addCategoryPriority(row?.compositions?.category_id);
   });
 
-  const selectColumns = `
+  const baseSelectColumns = `
+    id,
+    title,
+    description,
+    price,
+    difficulty,
+    duration,
+    language,
+    accompaniment,
+    voice_parts,
+    pdf_url,
+    created_at,
+    category_id,
+    composers(users(display_name)),
+    categories(name),
+    composition_stats(views, purchases)
+  `;
+  const selectColumnsWithPriceCurrency = `
     id,
     title,
     description,
@@ -179,10 +207,12 @@ async function fetchFallbackRecommendations(userId, limit) {
     composition_stats(views, purchases)
   `;
 
-  const fetchRows = async (categoryIds = null) => {
+  const fetchRows = async (categoryIds = null, includePriceCurrency = true) => {
     let query = supabaseAdmin
       .from("compositions")
-      .select(selectColumns)
+      .select(
+        includePriceCurrency ? selectColumnsWithPriceCurrency : baseSelectColumns,
+      )
       .eq("is_published", true)
       .eq("deleted", false)
       .order("created_at", { ascending: false })
@@ -193,6 +223,16 @@ async function fetchFallbackRecommendations(userId, limit) {
     }
 
     const { data, error } = await query;
+    if (error && includePriceCurrency && isMissingPriceCurrencyColumnError(error)) {
+      console.warn(
+        "[recommendations:fallback] price_currency column missing; retrying without it",
+      );
+      const fallback = await fetchRows(categoryIds, false);
+      return (fallback || []).map((row) => ({
+        ...row,
+        price_currency: "KES",
+      }));
+    }
     if (error) throw error;
     return data || [];
   };

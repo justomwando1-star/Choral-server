@@ -6,6 +6,19 @@ import {
 } from "../middleware/verifySupabaseToken.js";
 
 const router = express.Router();
+const ALLOWED_CATEGORY_NAMES = ["arrangements", "compositions"];
+
+function normalizeCategoryName(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return "";
+  if (normalized === "arrangements") return "Arrangements";
+  if (normalized === "compositions") return "Compositions";
+  return "";
+}
+
+function isAllowedCategoryName(value) {
+  return ALLOWED_CATEGORY_NAMES.includes(String(value || "").trim().toLowerCase());
+}
 
 // GET /api/categories - get all categories
 router.get("/", async (req, res) => {
@@ -17,7 +30,11 @@ router.get("/", async (req, res) => {
 
     if (error) throw error;
 
-    return res.json(data || []);
+    const filtered = (data || []).filter((category) =>
+      isAllowedCategoryName(category?.name),
+    );
+
+    return res.json(filtered);
   } catch (err) {
     console.error("[get-categories] Error:", err);
     return res
@@ -30,14 +47,20 @@ router.get("/", async (req, res) => {
 router.post("/", verifySupabaseToken, adminOnly, async (req, res) => {
   try {
     const { name, description } = req.body;
+    const normalizedName = normalizeCategoryName(name);
 
-    if (!name) {
-      return res.status(400).json({ message: "name is required" });
+    if (!normalizedName) {
+      return res.status(400).json({
+        message: "Category name must be either Arrangements or Compositions",
+      });
     }
 
     const { data, error } = await supabaseAdmin
       .from("categories")
-      .insert({ name, description })
+      .upsert(
+        { name: normalizedName, description },
+        { onConflict: "name" },
+      )
       .select()
       .maybeSingle();
 
