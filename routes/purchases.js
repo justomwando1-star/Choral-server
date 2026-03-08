@@ -4,6 +4,7 @@ import { verifySupabaseToken } from "../middleware/verifySupabaseToken.js";
 import { refreshCompositionPdfUrl } from "../utils/compositionPdfUrl.js";
 
 const router = express.Router();
+const MIN_PURCHASES_FOR_PERSONALIZED_RECOMMENDATIONS = 3;
 
 function isMissingBuyersTableError(err) {
   const code = String(err?.code || "").toUpperCase();
@@ -293,6 +294,20 @@ async function fetchFallbackRecommendations(userId, limit) {
   return await hydrateRecommendationRows(filteredRows);
 }
 
+async function countActivePurchasesForBuyerIds(buyerIds) {
+  const normalizedBuyerIds = Array.isArray(buyerIds) ? buyerIds.filter(Boolean) : [];
+  if (normalizedBuyerIds.length === 0) return 0;
+
+  const { count, error } = await supabaseAdmin
+    .from("purchases")
+    .select("id", { count: "exact", head: true })
+    .in("buyer_id", normalizedBuyerIds)
+    .eq("is_active", true);
+
+  if (error) throw error;
+  return Number(count || 0);
+}
+
 
 // GET /api/purchases - get buyer's purchases by auth UID
 router.get("/", verifySupabaseToken, async (req, res) => {
@@ -531,6 +546,7 @@ router.delete("/:id", verifySupabaseToken, async (req, res) => {
 
 // GET /api/purchases/recommendations - get FYP recommendations
 router.get("/recommendations", verifySupabaseToken, async (req, res) => {
+  let purchaseCount = 0;
   try {
     const { limit = 20 } = req.query;
     const safeLimit = parseSafeLimit(limit, 20, 50);
@@ -553,8 +569,28 @@ router.get("/recommendations", verifySupabaseToken, async (req, res) => {
     }
 
     const purchaseBuyerIds = await resolvePurchaseBuyerIds(user.id);
+    purchaseCount = await countActivePurchasesForBuyerIds(purchaseBuyerIds);
     const recommendationOwnerId =
       purchaseBuyerIds.find((id) => id !== user.id) || user.id;
+
+    if (purchaseCount < MIN_PURCHASES_FOR_PERSONALIZED_RECOMMENDATIONS) {
+      const fallbackRows = await fetchFallbackRecommendations(user.id, safeLimit);
+      const remainingPurchases =
+        MIN_PURCHASES_FOR_PERSONALIZED_RECOMMENDATIONS - purchaseCount;
+
+      return res.json({
+        recommendations: fallbackRows,
+        mode: "cold_start",
+        personalized: false,
+        purchaseCount,
+        minimumPurchasesForPersonalized:
+          MIN_PURCHASES_FOR_PERSONALIZED_RECOMMENDATIONS,
+        message:
+          remainingPurchases > 0
+            ? `Make ${remainingPurchases} more purchase${remainingPurchases === 1 ? "" : "s"} to unlock personalized recommendations.`
+            : "Make a few purchases to unlock personalized recommendations.",
+      });
+    }
 
     const { data, error } = await supabaseAdmin.rpc("get_fyp_recommendations", {
       p_buyer_id: recommendationOwnerId,
@@ -567,22 +603,51 @@ router.get("/recommendations", verifySupabaseToken, async (req, res) => {
         "[get-recommendations] recommendation RPC missing; using fallback query",
       );
       const fallbackRows = await fetchFallbackRecommendations(user.id, safeLimit);
-      return res.json(fallbackRows);
+      return res.json({
+        recommendations: fallbackRows,
+        mode: "fallback",
+        personalized: false,
+        purchaseCount,
+        minimumPurchasesForPersonalized:
+          MIN_PURCHASES_FOR_PERSONALIZED_RECOMMENDATIONS,
+        message: "Showing fallback recommendations while personalization initializes.",
+      });
     }
 
     const rows = Array.isArray(data) ? data : [];
     if (rows.length === 0) {
       const fallbackRows = await fetchFallbackRecommendations(user.id, safeLimit);
-      return res.json(fallbackRows);
+      return res.json({
+        recommendations: fallbackRows,
+        mode: "fallback",
+        personalized: false,
+        purchaseCount,
+        minimumPurchasesForPersonalized:
+          MIN_PURCHASES_FOR_PERSONALIZED_RECOMMENDATIONS,
+        message: "No personalized matches yet. Showing recent catalog picks instead.",
+      });
     }
 
     const hydratedRows = await hydrateRecommendationRows(rows);
-    return res.json(hydratedRows);
+    return res.json({
+      recommendations: hydratedRows,
+      mode: "personalized",
+      personalized: true,
+      purchaseCount,
+      minimumPurchasesForPersonalized:
+        MIN_PURCHASES_FOR_PERSONALIZED_RECOMMENDATIONS,
+    });
   } catch (err) {
     console.error("[get-recommendations] Error:", err);
-    return res.status(500).json({
-      message: "Failed to fetch recommendations",
-      error: err.message,
+    return res.json({
+      recommendations: [],
+      mode: "degraded",
+      personalized: false,
+      purchaseCount,
+      minimumPurchasesForPersonalized:
+        MIN_PURCHASES_FOR_PERSONALIZED_RECOMMENDATIONS,
+      message:
+        "Recommendations are temporarily unavailable. Browse the marketplace catalog while the service recovers.",
     });
   }
 });
