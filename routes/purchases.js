@@ -17,6 +17,35 @@ function isMissingBuyersTableError(err) {
   );
 }
 
+function isMissingBuyerPreferencesTableError(err) {
+  const code = String(err?.code || "").toUpperCase();
+  const message = String(err?.message || "").toLowerCase();
+  return (
+    code === "42P01" ||
+    code === "PGRST204" ||
+    code === "PGRST205" ||
+    message.includes("buyer_preferences") ||
+    message.includes('relation "buyer_preferences" does not exist')
+  );
+}
+
+function isMissingRecommendationRpcError(err) {
+  const code = String(err?.code || "").toUpperCase();
+  const message = String(err?.message || "").toLowerCase();
+  return (
+    code === "42883" ||
+    code === "PGRST202" ||
+    message.includes("get_fyp_recommendations") ||
+    message.includes("function") && message.includes("does not exist")
+  );
+}
+
+function parseSafeLimit(raw, fallback = 20, max = 50) {
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(Math.floor(parsed), max);
+}
+
 async function resolvePurchaseBuyerIds(userId) {
   const ids = [userId];
 
@@ -59,6 +88,169 @@ function appendDownloadQuery(url, fileName) {
   if (!url) return null;
   const separator = String(url).includes("?") ? "&" : "?";
   return `${url}${separator}download=${encodeURIComponent(fileName)}`;
+}
+
+async function hydrateRecommendationRows(rows) {
+  return await Promise.all(
+    (rows || []).map(async (row) => {
+      if (!row?.pdf_url) return row;
+      const refreshed = await refreshCompositionPdfUrl(row);
+      return {
+        ...row,
+        ...refreshed,
+      };
+    }),
+  );
+}
+
+async function fetchFallbackRecommendations(userId, limit) {
+  const safeLimit = parseSafeLimit(limit, 20, 50);
+  const purchaseBuyerIds = await resolvePurchaseBuyerIds(userId);
+  const purchasedCompositionIds = new Set();
+  const prioritizedCategoryIds = [];
+  const categoryPrioritySeen = new Set();
+
+  const addCategoryPriority = (value) => {
+    const categoryId = Number(value);
+    if (!Number.isFinite(categoryId) || categoryPrioritySeen.has(categoryId)) {
+      return;
+    }
+    categoryPrioritySeen.add(categoryId);
+    prioritizedCategoryIds.push(categoryId);
+  };
+
+  const { data: preferenceRows, error: preferenceError } = await supabaseAdmin
+    .from("buyer_preferences")
+    .select("category_id, weight")
+    .in("buyer_id", purchaseBuyerIds)
+    .order("weight", { ascending: false })
+    .limit(20);
+
+  if (preferenceError) {
+    if (isMissingBuyerPreferencesTableError(preferenceError)) {
+      console.warn(
+        "[recommendations:fallback] buyer_preferences missing; using purchase history only",
+      );
+    } else {
+      throw preferenceError;
+    }
+  } else {
+    (preferenceRows || []).forEach((row) => addCategoryPriority(row?.category_id));
+  }
+
+  const { data: purchaseRows, error: purchaseError } = await supabaseAdmin
+    .from("purchases")
+    .select(
+      `
+      composition_id,
+      compositions(category_id)
+    `,
+    )
+    .in("buyer_id", purchaseBuyerIds)
+    .eq("is_active", true)
+    .order("purchased_at", { ascending: false })
+    .limit(250);
+
+  if (purchaseError) throw purchaseError;
+
+  (purchaseRows || []).forEach((row) => {
+    if (row?.composition_id) {
+      purchasedCompositionIds.add(row.composition_id);
+    }
+    addCategoryPriority(row?.compositions?.category_id);
+  });
+
+  const selectColumns = `
+    id,
+    title,
+    description,
+    price,
+    price_currency,
+    difficulty,
+    duration,
+    language,
+    accompaniment,
+    voice_parts,
+    pdf_url,
+    created_at,
+    category_id,
+    composers(users(display_name)),
+    categories(name),
+    composition_stats(views, purchases)
+  `;
+
+  const fetchRows = async (categoryIds = null) => {
+    let query = supabaseAdmin
+      .from("compositions")
+      .select(selectColumns)
+      .eq("is_published", true)
+      .eq("deleted", false)
+      .order("created_at", { ascending: false })
+      .limit(Math.max(safeLimit * 4, 24));
+
+    if (Array.isArray(categoryIds) && categoryIds.length > 0) {
+      query = query.in("category_id", categoryIds);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+    return data || [];
+  };
+
+  const preferredRows =
+    prioritizedCategoryIds.length > 0
+      ? await fetchRows(prioritizedCategoryIds)
+      : [];
+  const recentRows = await fetchRows();
+
+  const categoryPriority = new Map(
+    prioritizedCategoryIds.map((categoryId, index) => [categoryId, index]),
+  );
+  const mergedRows = [...preferredRows, ...recentRows];
+  const seenCompositionIds = new Set();
+
+  const filteredRows = mergedRows
+    .filter((row) => {
+      if (!row?.id || purchasedCompositionIds.has(row.id)) return false;
+      if (seenCompositionIds.has(row.id)) return false;
+      seenCompositionIds.add(row.id);
+      return true;
+    })
+    .sort((a, b) => {
+      const aCategoryPriority = categoryPriority.has(Number(a?.category_id))
+        ? categoryPriority.get(Number(a.category_id))
+        : Number.MAX_SAFE_INTEGER;
+      const bCategoryPriority = categoryPriority.has(Number(b?.category_id))
+        ? categoryPriority.get(Number(b.category_id))
+        : Number.MAX_SAFE_INTEGER;
+
+      if (aCategoryPriority !== bCategoryPriority) {
+        return aCategoryPriority - bCategoryPriority;
+      }
+
+      const aStats = Array.isArray(a?.composition_stats)
+        ? a.composition_stats[0]
+        : a?.composition_stats || {};
+      const bStats = Array.isArray(b?.composition_stats)
+        ? b.composition_stats[0]
+        : b?.composition_stats || {};
+
+      const aPurchases = Number(aStats?.purchases || 0);
+      const bPurchases = Number(bStats?.purchases || 0);
+      if (aPurchases !== bPurchases) return bPurchases - aPurchases;
+
+      const aViews = Number(aStats?.views || 0);
+      const bViews = Number(bStats?.views || 0);
+      if (aViews !== bViews) return bViews - aViews;
+
+      return (
+        new Date(b?.created_at || 0).getTime() -
+        new Date(a?.created_at || 0).getTime()
+      );
+    })
+    .slice(0, safeLimit);
+
+  return await hydrateRecommendationRows(filteredRows);
 }
 
 
@@ -301,6 +493,7 @@ router.delete("/:id", verifySupabaseToken, async (req, res) => {
 router.get("/recommendations", verifySupabaseToken, async (req, res) => {
   try {
     const { limit = 20 } = req.query;
+    const safeLimit = parseSafeLimit(limit, 20, 50);
     const authUid = req.authUid;
 
     if (!authUid) {
@@ -319,15 +512,32 @@ router.get("/recommendations", verifySupabaseToken, async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Get recommendations using RPC
+    const purchaseBuyerIds = await resolvePurchaseBuyerIds(user.id);
+    const recommendationOwnerId =
+      purchaseBuyerIds.find((id) => id !== user.id) || user.id;
+
     const { data, error } = await supabaseAdmin.rpc("get_fyp_recommendations", {
-      p_buyer_id: user.id,
-      p_limit: Number(limit),
+      p_buyer_id: recommendationOwnerId,
+      p_limit: safeLimit,
     });
 
-    if (error) throw error;
+    if (error) {
+      if (!isMissingRecommendationRpcError(error)) throw error;
+      console.warn(
+        "[get-recommendations] recommendation RPC missing; using fallback query",
+      );
+      const fallbackRows = await fetchFallbackRecommendations(user.id, safeLimit);
+      return res.json(fallbackRows);
+    }
 
-    return res.json(data || []);
+    const rows = Array.isArray(data) ? data : [];
+    if (rows.length === 0) {
+      const fallbackRows = await fetchFallbackRecommendations(user.id, safeLimit);
+      return res.json(fallbackRows);
+    }
+
+    const hydratedRows = await hydrateRecommendationRows(rows);
+    return res.json(hydratedRows);
   } catch (err) {
     console.error("[get-recommendations] Error:", err);
     return res.status(500).json({
@@ -362,14 +572,26 @@ router.put("/preferences", verifySupabaseToken, async (req, res) => {
       return res.status(404).json({ message: "User not found" });
     }
 
-    // Update preferences
-    const { error } = await supabaseAdmin.from("buyer_preferences").upsert({
-      buyer_id: user.id,
-      category_id,
-      weight,
-    });
+    const { error } = await supabaseAdmin.from("buyer_preferences").upsert(
+      {
+        buyer_id: user.id,
+        category_id,
+        weight,
+      },
+      {
+        onConflict: "buyer_id,category_id",
+      },
+    );
 
-    if (error) throw error;
+    if (error) {
+      if (isMissingBuyerPreferencesTableError(error)) {
+        return res.status(503).json({
+          message:
+            "Buyer preferences storage is not available yet. Apply the buyer preferences migration first.",
+        });
+      }
+      throw error;
+    }
 
     return res.json({ message: "Preferences updated" });
   } catch (err) {

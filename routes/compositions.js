@@ -35,7 +35,7 @@ const VOICE_PART_OPTIONS = [
   "Soprano I",
   "Soprano II",
 ];
-const PRICE_CURRENCY_DEFAULT = "USD";
+const PRICE_CURRENCY_DEFAULT = "KES";
 const CURRENCY_ALIAS_MAP = {
   USD: "USD",
   US: "USD",
@@ -81,11 +81,25 @@ function isMissingPriceCurrencyColumnError(err) {
 }
 
 function normalizePriceCurrency(value) {
-  const trimmed = String(value || "")
-    .trim()
-    .toUpperCase();
-  if (!trimmed) return PRICE_CURRENCY_DEFAULT;
-  return trimmed.slice(0, 16);
+  void value;
+  return PRICE_CURRENCY_DEFAULT;
+}
+
+function normalizeAccompanimentInput(value) {
+  if (Array.isArray(value)) {
+    const uniqueParts = [
+      ...new Set(
+        value
+          .flatMap((item) => String(item || "").split(/[,;|•]/g))
+          .map((item) => item.trim())
+          .filter(Boolean),
+      ),
+    ];
+    return uniqueParts.length > 0 ? uniqueParts.join(", ") : null;
+  }
+
+  const text = String(value || "").trim();
+  return text ? text : null;
 }
 
 function normalizeCurrencyCode(value) {
@@ -743,7 +757,7 @@ router.post("/", verifySupabaseToken, async (req, res) => {
       hasPdfUrl: Boolean(pdf_url || file_url),
       difficulty: difficulty || null,
       language: language || null,
-      accompaniment: accompaniment || null,
+      accompaniment: normalizeAccompanimentInput(accompaniment),
       voicePartsCount: Array.isArray(voice_parts) ? voice_parts.length : 0,
     });
 
@@ -884,7 +898,9 @@ router.put("/:id", verifySupabaseToken, async (req, res) => {
     if (difficulty !== undefined) updates.difficulty = difficulty || null;
     if (language !== undefined) updates.language = language || null;
     if (duration !== undefined) updates.duration = duration || null;
-    if (accompaniment !== undefined) updates.accompaniment = accompaniment || null;
+    if (accompaniment !== undefined) {
+      updates.accompaniment = normalizeAccompanimentInput(accompaniment);
+    }
     if (voice_parts !== undefined)
       updates.voice_parts = Array.isArray(voice_parts) ? voice_parts : null;
     if (pdf_url !== undefined) updates.pdf_url = pdf_url || null;

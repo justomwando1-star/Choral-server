@@ -17,6 +17,7 @@ import categoriesRouter from "./routes/categories.js";
 import adminRouter from "./routes/admin.js";
 import mediaRouter from "./routes/media.js";
 import supportRouter from "./routes/support.js";
+import notificationsRouter from "./routes/notifications.js";
 import enrollmentsRouter from "./routes/enrollments.js";
 import registrationRouter from "./routes/registration.js";
 
@@ -80,6 +81,7 @@ app.use("/api/categories", categoriesRouter);
 app.use("/api/admin", adminRouter);
 app.use("/api/media", mediaRouter);
 app.use("/api/support", supportRouter);
+app.use("/api/notifications", notificationsRouter);
 app.use("/api/enrollments", enrollmentsRouter);
 app.use("/api/registration", registrationRouter);
 
