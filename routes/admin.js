@@ -1831,6 +1831,75 @@ router.post("/users/:userId/suspend", async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+router.post("/users/:userId/unsuspend", async (req, res) => {
+  try {
+    const { userId: userIdentifier } = req.params;
+    const user = await resolveDbUser(userIdentifier);
+    if (!user) return res.status(404).json({ error: "User not found" });
+    const { error } = await supabase
+      .from("users")
+      .update({ is_active: true })
+      .eq("id", user.id);
+    if (error) throw error;
+    return res.json({ success: true, message: "User unsuspended" });
+  } catch (err) {
+    console.error("[admin-unsuspend-user] Error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete("/users/:userId", async (req, res) => {
+  try {
+    const { userId: userIdentifier } = req.params;
+    const targetUser = await resolveDbUser(userIdentifier);
+    if (!targetUser) return res.status(404).json({ error: "User not found" });
+
+    const userId = targetUser.id;
+    const normalizedEmail = String(targetUser.email || "").trim().toLowerCase();
+
+    await supabase.from("composers").delete().eq("user_id", userId);
+    await supabase.from("user_roles").delete().eq("user_id", userId);
+    await supabase.from("role_requests").delete().eq("user_id", userId);
+
+    if (normalizedEmail) {
+      const { error: deactivateAdminEmailErr } = await supabase
+        .from("admin_emails")
+        .update({ is_active: false })
+        .ilike("email", normalizedEmail)
+        .eq("is_active", true);
+      if (deactivateAdminEmailErr)
+        console.warn(
+          "[admin-delete-user] Failed to deactivate admin email:",
+          deactivateAdminEmailErr,
+        );
+    }
+
+    const { error: deleteUserErr } = await supabase
+      .from("users")
+      .delete()
+      .eq("id", userId);
+    if (deleteUserErr) throw deleteUserErr;
+
+    if (targetUser.auth_uid) {
+      if (typeof supabase.auth.admin?.deleteUser === "function") {
+        await supabase.auth.admin.deleteUser(targetUser.auth_uid);
+      } else {
+        console.warn(
+          "[admin-delete-user] supabase auth admin deleteUser not available",
+        );
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: "User deleted",
+      userId,
+    });
+  } catch (err) {
+    console.error("[admin-delete-user] Error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 router.post("/composer-requests/:userId/reject", async (req, res) => {
   try {
@@ -2486,4 +2555,5 @@ router.get("/notifications", async (req, res) => {
 });
 
 export default router;
+
 
