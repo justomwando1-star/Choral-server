@@ -10,6 +10,12 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 },
 });
+const ADMIN_IDENTIFIERS = new Set(
+  String(process.env.ADMIN_IDENTIFIERS || "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean),
+);
 
 const DIFFICULTY_OPTIONS = ["Easy", "Intermediate", "Advanced"];
 const LANGUAGE_OPTIONS = [
@@ -943,9 +949,80 @@ router.put("/:id", verifySupabaseToken, async (req, res) => {
 router.delete("/:id", verifySupabaseToken, async (req, res) => {
   try {
     const { id } = req.params;
+    const authUid = req.authUid;
     const hardDelete = String(req.query?.hard || "true").toLowerCase() !== "false";
     if (!id) return res.status(400).json({ message: "id is required" });
+    if (!authUid) return res.status(401).json({ message: "Unauthorized" });
 
+    const { data: requester, error: requesterErr } = await supabaseAdmin
+      .from("users")
+      .select("id, email")
+      .eq("auth_uid", authUid)
+      .maybeSingle();
+    if (requesterErr) throw requesterErr;
+    if (!requester?.id) {
+      return res.status(404).json({ message: "User profile not found" });
+    }
+
+    const { data: composition, error: compositionErr } = await supabaseAdmin
+      .from("compositions")
+      .select("id, title, deleted, composer_id, composers(user_id)")
+      .eq("id", id)
+      .maybeSingle();
+    if (compositionErr) throw compositionErr;
+    if (!composition) {
+      return res.status(404).json({ message: "Composition not found" });
+    }
+
+    const ownerUserId = Array.isArray(composition.composers)
+      ? composition.composers?.[0]?.user_id || null
+      : composition.composers?.user_id || null;
+    const isOwner = Boolean(ownerUserId && ownerUserId === requester.id);
+
+    let isAdmin = false;
+    if (!isOwner) {
+      const normalizedEmail = String(requester.email || "").trim().toLowerCase();
+      if (normalizedEmail && ADMIN_IDENTIFIERS.has(normalizedEmail)) {
+        isAdmin = true;
+      } else {
+        const { data: roleRows, error: roleErr } = await supabaseAdmin
+          .from("user_roles")
+          .select("roles(name)")
+          .eq("user_id", requester.id);
+
+        if (roleErr) {
+          console.warn('[delete-composition] user_roles check failed:', roleErr?.message || roleErr);
+        } else {
+          isAdmin = (roleRows || []).some(
+            (row) => String(row?.roles?.name || "").toLowerCase() === "admin",
+          );
+        }
+
+        if (!isAdmin && normalizedEmail) {
+          const { data: adminEmail, error: adminErr } = await supabaseAdmin
+            .from("admin_emails")
+            .select("id")
+            .ilike("email", normalizedEmail)
+            .eq("is_active", true)
+            .maybeSingle();
+
+          if (adminErr) {
+            console.warn(
+              "[delete-composition] admin_emails check failed:",
+              adminErr?.message || adminErr,
+            );
+          } else if (adminEmail) {
+            isAdmin = true;
+          }
+        }
+      }
+    }
+
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    let hard = false;
     if (hardDelete) {
       const { error: hardErr } = await supabaseAdmin
         .from("compositions")
@@ -953,34 +1030,49 @@ router.delete("/:id", verifySupabaseToken, async (req, res) => {
         .eq("id", id);
 
       if (!hardErr) {
-        return res.json({ message: "Composition deleted from database", hard: true });
+        hard = true;
+      } else {
+        const fkBlocked =
+          String(hardErr?.code || "") === "23503" ||
+          String(hardErr?.message || "")
+            .toLowerCase()
+            .includes("foreign key");
+
+        if (!fkBlocked) throw hardErr;
+
+        console.warn(
+          "[delete-composition] hard delete blocked by FK; applying soft delete:",
+          hardErr?.message || hardErr,
+        );
       }
+    }
 
-      // Fallback to soft delete when hard delete is blocked by FK constraints.
-      const fkBlocked =
-        String(hardErr?.code || "") === "23503" ||
-        String(hardErr?.message || "")
-          .toLowerCase()
-          .includes("foreign key");
+    if (!hard) {
+      const { error: softErr } = await supabaseAdmin
+        .from("compositions")
+        .update({ deleted: true, is_published: false })
+        .eq("id", id);
 
-      if (!fkBlocked) throw hardErr;
+      if (softErr) throw softErr;
+    }
 
+    // Revoke access for all buyers who previously purchased this composition.
+    const { error: revokeErr } = await supabaseAdmin
+      .from("purchases")
+      .update({ is_active: false })
+      .eq("composition_id", id)
+      .eq("is_active", true);
+
+    if (revokeErr) {
       console.warn(
-        "[delete-composition] hard delete blocked by FK; applying soft delete:",
-        hardErr?.message || hardErr,
+        "[delete-composition] failed to deactivate purchases:",
+        revokeErr?.message || revokeErr,
       );
     }
 
-    const { error: softErr } = await supabaseAdmin
-      .from("compositions")
-      .update({ deleted: true, is_published: false })
-      .eq("id", id);
-
-    if (softErr) throw softErr;
-
     return res.json({
-      message: "Composition soft-deleted",
-      hard: false,
+      message: hard ? "Composition deleted from database" : "Composition soft-deleted",
+      hard,
     });
   } catch (err) {
     console.error("[delete-composition] Error:", err);
@@ -989,3 +1081,5 @@ router.delete("/:id", verifySupabaseToken, async (req, res) => {
 });
 
 export default router;
+
+
