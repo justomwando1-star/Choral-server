@@ -9,7 +9,7 @@ const router = express.Router();
 const MPESA_BUSINESS_NUMBER =
   process.env.MPESA_BUSINESS_NUMBER || "400200";
 const MPESA_ACCOUNT_NUMBER =
-  process.env.MPESA_ACCOUNT_NO || process.env.MPESA_ACCOUNT_NUMBER || "11317282";
+  process.env.MPESA_ACCOUNT_NO || process.env.MPESA_ACCOUNT_NUMBER || "1131723";
 const MPESA_BUSINESS_NAME =
   process.env.MPESA_BUSINESS_NAME || "Murekefu Music Hub";
 const MPESA_PAYMENT_URL =
