@@ -33,10 +33,10 @@ export function extractCompositionStoragePath(pdfUrl) {
   }
 }
 
-export async function refreshCompositionPdfUrl(composition) {
-  if (!composition?.pdf_url) return composition;
+async function refreshSignedUrlForField(composition, field) {
+  if (!composition?.[field]) return composition;
 
-  const storagePath = extractCompositionStoragePath(composition.pdf_url);
+  const storagePath = extractCompositionStoragePath(composition[field]);
   if (!storagePath) return composition;
 
   const { data, error } = await supabaseAdmin.storage
@@ -44,8 +44,9 @@ export async function refreshCompositionPdfUrl(composition) {
     .createSignedUrl(storagePath, resolveSignedUrlTtlSeconds());
 
   if (error || !data?.signedUrl) {
-    console.warn("[composition-pdf] Failed to refresh signed URL:", {
+    console.warn("[composition-file] Failed to refresh signed URL:", {
       compositionId: composition.id,
+      field,
       path: storagePath,
       error: error?.message || error || "missing signedUrl",
     });
@@ -54,8 +55,15 @@ export async function refreshCompositionPdfUrl(composition) {
 
   return {
     ...composition,
-    pdf_url: data.signedUrl,
+    [field]: data.signedUrl,
   };
+}
+
+export async function refreshCompositionPdfUrl(composition) {
+  let updated = composition;
+  updated = await refreshSignedUrlForField(updated, "pdf_url");
+  updated = await refreshSignedUrlForField(updated, "midi_url");
+  return updated;
 }
 
 export async function refreshCompositionPdfUrls(compositions) {

@@ -583,6 +583,8 @@ router.get("/", async (req, res) => {
       category_id,
       price,
       pdf_url,
+      midi_url,
+      midi_url,
       thumbnail_url,
       created_at,
       duration,
@@ -603,6 +605,7 @@ router.get("/", async (req, res) => {
       price,
       price_currency,
       pdf_url,
+      midi_url,
       thumbnail_url,
       created_at,
       duration,
@@ -761,6 +764,7 @@ router.post("/", verifySupabaseToken, async (req, res) => {
       price: price ?? null,
       price_currency: normalizePriceCurrency(price_currency),
       hasPdfUrl: Boolean(pdf_url || file_url),
+      hasMidiUrl: Boolean(midi_url),
       difficulty: difficulty || null,
       language: language || null,
       accompaniment: normalizeAccompanimentInput(accompaniment),
@@ -817,6 +821,7 @@ router.post("/", verifySupabaseToken, async (req, res) => {
       price: price || 0,
       price_currency: normalizePriceCurrency(price_currency),
       pdf_url: pdf_url || file_url || null,
+      midi_url: midi_url || null,
       thumbnail_url: thumbnail_url || null,
       duration: duration || (duration_seconds ? String(duration_seconds) : null),
       difficulty: difficulty || null,
@@ -888,6 +893,7 @@ router.put("/:id", verifySupabaseToken, async (req, res) => {
       accompaniment,
       voice_parts,
       pdf_url,
+      midi_url,
       thumbnail_url,
     } = req.body;
 
@@ -910,6 +916,7 @@ router.put("/:id", verifySupabaseToken, async (req, res) => {
     if (voice_parts !== undefined)
       updates.voice_parts = Array.isArray(voice_parts) ? voice_parts : null;
     if (pdf_url !== undefined) updates.pdf_url = pdf_url || null;
+    if (midi_url !== undefined) updates.midi_url = midi_url || null;
     if (thumbnail_url !== undefined) updates.thumbnail_url = thumbnail_url || null;
 
     let { data, error } = await supabaseAdmin

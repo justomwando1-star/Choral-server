@@ -77,13 +77,20 @@ router.post(
           .json({ message: "Only image files are allowed for this bucket." });
       }
 
-      if (
-        bucket === "compositions" &&
-        !["application/pdf", "application/octet-stream"].includes(mimeType)
-      ) {
-        return res
-          .status(400)
-          .json({ message: "Only PDF files are allowed for compositions." });
+      if (bucket === "compositions") {
+        const allowedCompositionTypes = new Set([
+          "application/pdf",
+          "application/octet-stream",
+          "audio/midi",
+          "audio/x-midi",
+          "audio/mid",
+          "application/x-midi",
+        ]);
+        if (!allowedCompositionTypes.has(mimeType)) {
+          return res.status(400).json({
+            message: "Only PDF or MIDI files are allowed for compositions.",
+          });
+        }
       }
 
       const ext = path.extname(req.file.originalname) || "";
