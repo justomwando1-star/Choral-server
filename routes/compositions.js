@@ -3,7 +3,11 @@ import multer from "multer";
 import { PDFParse } from "pdf-parse";
 import { supabaseAdmin } from "../lib/supabaseServer.js";
 import { verifySupabaseToken } from "../middleware/verifySupabaseToken.js";
-import { refreshCompositionPdfUrl, refreshCompositionPdfUrls } from "../utils/compositionPdfUrl.js";
+import {
+  extractCompositionStoragePath,
+  refreshCompositionPdfUrl,
+  refreshCompositionPdfUrls,
+} from "../utils/compositionPdfUrl.js";
 
 const router = express.Router();
 const upload = multer({
@@ -691,6 +695,60 @@ router.get("/composer/:composerId", async (req, res) => {
     return res.json(composerCompositionsWithFreshPdfUrls);
   } catch (err) {
     console.error("[get-composer-compositions] Error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/compositions/:id/midi - stream MIDI preview
+router.get("/:id/midi", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ message: "id is required" });
+
+    const { data, error } = await supabaseAdmin
+      .from("compositions")
+      .select("id, midi_url")
+      .eq("id", id)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data?.midi_url) {
+      return res.status(404).json({ message: "MIDI preview not available" });
+    }
+
+    const storagePath = extractCompositionStoragePath(data.midi_url);
+    if (!storagePath) {
+      return res
+        .status(400)
+        .json({ message: "Invalid MIDI storage path" });
+    }
+
+    const { data: fileData, error: downloadError } = await supabaseAdmin.storage
+      .from("compositions")
+      .download(storagePath);
+
+    if (downloadError) throw downloadError;
+    if (!fileData) {
+      return res.status(404).json({ message: "MIDI file not found" });
+    }
+
+    let buffer;
+    if (Buffer.isBuffer(fileData)) {
+      buffer = fileData;
+    } else if (fileData instanceof ArrayBuffer) {
+      buffer = Buffer.from(fileData);
+    } else if (typeof fileData.arrayBuffer === "function") {
+      buffer = Buffer.from(await fileData.arrayBuffer());
+    } else {
+      buffer = Buffer.from(fileData);
+    }
+
+    res.setHeader("Content-Type", "audio/midi");
+    res.setHeader("Cache-Control", "public, max-age=300");
+    res.setHeader("Content-Disposition", "inline; filename=\"preview.mid\"");
+    return res.status(200).send(buffer);
+  } catch (err) {
+    console.error("[composition-midi] Error:", err);
     return res.status(500).json({ error: err.message });
   }
 });
