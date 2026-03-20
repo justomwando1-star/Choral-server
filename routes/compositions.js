@@ -749,6 +749,7 @@ router.post("/", verifySupabaseToken, async (req, res) => {
       pdf_url,
       midi_url,
       thumbnail_url,
+      original_link,
       duration_seconds,
       duration,
       difficulty,
@@ -823,6 +824,7 @@ router.post("/", verifySupabaseToken, async (req, res) => {
       price_currency: normalizePriceCurrency(price_currency),
       pdf_url: pdf_url || file_url || null,
       midi_url: midi_url || null,
+      original_link: original_link || null,
       thumbnail_url: thumbnail_url || null,
       duration: duration || (duration_seconds ? String(duration_seconds) : null),
       difficulty: difficulty || null,
@@ -896,6 +898,7 @@ router.put("/:id", verifySupabaseToken, async (req, res) => {
       pdf_url,
       midi_url,
       thumbnail_url,
+      original_link,
     } = req.body;
 
     if (!id) return res.status(400).json({ message: "id is required" });
@@ -919,6 +922,7 @@ router.put("/:id", verifySupabaseToken, async (req, res) => {
     if (pdf_url !== undefined) updates.pdf_url = pdf_url || null;
     if (midi_url !== undefined) updates.midi_url = midi_url || null;
     if (thumbnail_url !== undefined) updates.thumbnail_url = thumbnail_url || null;
+    if (original_link !== undefined) updates.original_link = original_link || null;
 
     let { data, error } = await supabaseAdmin
       .from("compositions")
