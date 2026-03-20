@@ -747,6 +747,7 @@ router.post("/", verifySupabaseToken, async (req, res) => {
       price_currency,
       file_url,
       pdf_url,
+      midi_url,
       thumbnail_url,
       duration_seconds,
       duration,
