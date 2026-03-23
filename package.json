@@ -5,6 +5,7 @@
   "description": "Supabase-only API server",
   "main": "index.js",
   "scripts": {
+    "build": "node -e \"console.log('Backend build step complete')\"",
     "start": "node index.js",
     "dev": "node ./scripts/ensure-port-free.mjs 3001 && nodemon index.js",
     "test": "node --test"
@@ -14,6 +15,7 @@
     "cors": "^2.8.5",
     "dotenv": "^17.3.1",
     "express": "^4.18.2",
+    "google-auth-library": "^9.15.1",
     "jsonwebtoken": "^9.0.2",
     "multer": "^1.4.5-lts.1",
     "pdf-parse": "^2.4.5"
