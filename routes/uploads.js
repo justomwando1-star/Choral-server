@@ -19,7 +19,67 @@ const BUCKET_MAX_SIZE_BYTES = {
   avatars: 8 * 1024 * 1024,
   thumbnails: 10 * 1024 * 1024,
   compositions: 30 * 1024 * 1024,
+  community: 30 * 1024 * 1024,
 };
+
+const COMMUNITY_DOCUMENT_MIME_TYPES = new Set([
+  "application/pdf",
+  "text/plain",
+  "text/csv",
+  "application/rtf",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-powerpoint",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+]);
+
+const COMMUNITY_DOCUMENT_EXTENSIONS = new Set([
+  ".pdf",
+  ".doc",
+  ".docx",
+  ".txt",
+  ".rtf",
+  ".csv",
+  ".xls",
+  ".xlsx",
+  ".ppt",
+  ".pptx",
+]);
+
+async function ensureBucketExists(bucket) {
+  if (bucket !== "community") return;
+
+  const { data: existingBucket, error: lookupErr } = await supabaseAdmin.storage.getBucket(
+    bucket,
+  );
+
+  if (!lookupErr && existingBucket?.id) {
+    return;
+  }
+
+  const lookupMessage = String(lookupErr?.message || "").toLowerCase();
+  if (
+    lookupErr &&
+    !lookupMessage.includes("not found") &&
+    !lookupMessage.includes("does not exist")
+  ) {
+    throw lookupErr;
+  }
+
+  const { error: createErr } = await supabaseAdmin.storage.createBucket(bucket, {
+    public: true,
+    fileSizeLimit: `${Math.floor((BUCKET_MAX_SIZE_BYTES[bucket] || 30 * 1024 * 1024) / (1024 * 1024))}MB`,
+  });
+
+  if (createErr) {
+    const createMessage = String(createErr?.message || "").toLowerCase();
+    if (!createMessage.includes("already exists")) {
+      throw createErr;
+    }
+  }
+}
 
 function runSingleUpload(req, res, next) {
   upload.single("file")(req, res, (err) => {
@@ -55,7 +115,7 @@ router.post(
         size: req.file?.size || 0,
       });
 
-      if (!["avatars", "compositions", "thumbnails"].includes(bucket)) {
+      if (!["avatars", "compositions", "thumbnails", "community"].includes(bucket)) {
         return res.status(400).json({ message: "Invalid bucket" });
       }
       if (!req.file) return res.status(400).json({ message: "File required" });
@@ -93,8 +153,27 @@ router.post(
         }
       }
 
+      if (bucket === "community") {
+        const extension = String(path.extname(req.file.originalname) || "").toLowerCase();
+        const isSupportedCommunityAttachment =
+          mimeType.startsWith("image/") ||
+          mimeType.startsWith("video/") ||
+          mimeType.startsWith("audio/") ||
+          COMMUNITY_DOCUMENT_MIME_TYPES.has(mimeType) ||
+          COMMUNITY_DOCUMENT_EXTENSIONS.has(extension);
+
+        if (!isSupportedCommunityAttachment) {
+          return res.status(400).json({
+            message:
+              "Community attachments must be an image, video, audio file, or supported document.",
+          });
+        }
+      }
+
       const ext = path.extname(req.file.originalname) || "";
       const filename = `${authUid}/${Date.now()}-${crypto.randomBytes(6).toString("hex")}${ext}`;
+
+      await ensureBucketExists(bucket);
 
       // upload using admin client (service role)
       const { error } = await supabaseAdmin.storage
@@ -103,7 +182,7 @@ router.post(
 
       if (error) throw error;
 
-      if (bucket === "avatars") {
+      if (bucket === "avatars" || bucket === "community") {
         const { data: publicData } = supabaseAdmin.storage
           .from(bucket)
           .getPublicUrl(filename);
@@ -113,15 +192,19 @@ router.post(
             bucket,
             filename,
           });
-          return res.json({ success: true, url: publicData.publicUrl });
+          return res.json({
+            success: true,
+            url: publicData.publicUrl,
+            path: filename,
+            bucket,
+            mimeType,
+          });
         }
 
-        console.warn(
-          "[upload] avatar public URL missing, falling back to signed URL",
-          {
-            filename,
-          },
-        );
+        console.warn("[upload] public URL missing, falling back to signed URL", {
+          bucket,
+          filename,
+        });
       }
 
       // Private assets still use signed URLs.
@@ -138,10 +221,22 @@ router.post(
         const { data: pub } = supabaseAdmin.storage
           .from(bucket)
           .getPublicUrl(filename);
-        return res.json({ success: true, url: pub.publicUrl });
+        return res.json({
+          success: true,
+          url: pub.publicUrl,
+          path: filename,
+          bucket,
+          mimeType,
+        });
       }
 
-      return res.json({ success: true, url: signedData?.signedUrl || null });
+      return res.json({
+        success: true,
+        url: signedData?.signedUrl || null,
+        path: filename,
+        bucket,
+        mimeType,
+      });
     } catch (err) {
       console.error("[upload] failed", err);
       return serverError(res, err);

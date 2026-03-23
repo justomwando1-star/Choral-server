@@ -219,7 +219,14 @@ router.post("/ensure", async (req, res) => {
         theme_settings:
           theme_settings && typeof theme_settings === "object"
             ? theme_settings
-            : { preset: "emerald" },
+            : {
+                preset: "emerald",
+                mode: "light",
+                uiScale: "standard",
+                iconScale: "medium",
+                layoutDensity: "balanced",
+                surfaceStyle: "soft",
+              },
       })
       .select()
       .maybeSingle();

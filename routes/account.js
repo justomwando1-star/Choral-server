@@ -19,6 +19,17 @@ const ALLOWED_THEME_PRESETS = new Set([
   "forest",
 ]);
 const ALLOWED_THEME_MODES = new Set(["light", "dark"]);
+const ALLOWED_DARK_HUES = new Set([
+  "plum",
+  "midnight",
+  "graphite",
+  "forest-night",
+  "ember",
+]);
+const ALLOWED_UI_SCALES = new Set(["compact", "standard", "large"]);
+const ALLOWED_ICON_SCALES = new Set(["small", "medium", "large"]);
+const ALLOWED_LAYOUT_DENSITIES = new Set(["compact", "balanced", "spacious"]);
+const ALLOWED_SURFACE_STYLES = new Set(["soft", "glass", "solid"]);
 
 function normalizeThemeSettings(themeSettings, existingThemeSettings = null) {
   if (!themeSettings || typeof themeSettings !== "object") return null;
@@ -29,15 +40,66 @@ function normalizeThemeSettings(themeSettings, existingThemeSettings = null) {
   const existingModeRaw = String(existingThemeSettings?.mode || "")
     .trim()
     .toLowerCase();
+  const existingDarkHueRaw = String(existingThemeSettings?.darkHue || "")
+    .trim()
+    .toLowerCase();
+  const existingUiScaleRaw = String(existingThemeSettings?.uiScale || "")
+    .trim()
+    .toLowerCase();
+  const existingIconScaleRaw = String(existingThemeSettings?.iconScale || "")
+    .trim()
+    .toLowerCase();
+  const existingLayoutDensityRaw = String(existingThemeSettings?.layoutDensity || "")
+    .trim()
+    .toLowerCase();
+  const existingSurfaceStyleRaw = String(existingThemeSettings?.surfaceStyle || "")
+    .trim()
+    .toLowerCase();
 
   let preset = ALLOWED_THEME_PRESETS.has(existingPresetRaw)
     ? existingPresetRaw
     : "emerald";
   let mode = ALLOWED_THEME_MODES.has(existingModeRaw) ? existingModeRaw : "light";
+  let darkHue = ALLOWED_DARK_HUES.has(existingDarkHueRaw)
+    ? existingDarkHueRaw
+    : "plum";
+  let uiScale = ALLOWED_UI_SCALES.has(existingUiScaleRaw)
+    ? existingUiScaleRaw
+    : "standard";
+  let iconScale = ALLOWED_ICON_SCALES.has(existingIconScaleRaw)
+    ? existingIconScaleRaw
+    : "medium";
+  let layoutDensity = ALLOWED_LAYOUT_DENSITIES.has(existingLayoutDensityRaw)
+    ? existingLayoutDensityRaw
+    : "balanced";
+  let surfaceStyle = ALLOWED_SURFACE_STYLES.has(existingSurfaceStyleRaw)
+    ? existingSurfaceStyleRaw
+    : "soft";
 
   const hasPreset = Object.prototype.hasOwnProperty.call(themeSettings, "preset");
   const hasMode = Object.prototype.hasOwnProperty.call(themeSettings, "mode");
-  if (!hasPreset && !hasMode) return null;
+  const hasUiScale = Object.prototype.hasOwnProperty.call(themeSettings, "uiScale");
+  const hasDarkHue = Object.prototype.hasOwnProperty.call(themeSettings, "darkHue");
+  const hasIconScale = Object.prototype.hasOwnProperty.call(themeSettings, "iconScale");
+  const hasLayoutDensity = Object.prototype.hasOwnProperty.call(
+    themeSettings,
+    "layoutDensity",
+  );
+  const hasSurfaceStyle = Object.prototype.hasOwnProperty.call(
+    themeSettings,
+    "surfaceStyle",
+  );
+  if (
+    !hasPreset &&
+    !hasMode &&
+    !hasDarkHue &&
+    !hasUiScale &&
+    !hasIconScale &&
+    !hasLayoutDensity &&
+    !hasSurfaceStyle
+  ) {
+    return null;
+  }
 
   if (hasPreset) {
     const presetRaw = String(themeSettings.preset || "")
@@ -55,7 +117,47 @@ function normalizeThemeSettings(themeSettings, existingThemeSettings = null) {
     mode = modeRaw;
   }
 
-  return { preset, mode };
+  if (hasDarkHue) {
+    const darkHueRaw = String(themeSettings.darkHue || "")
+      .trim()
+      .toLowerCase();
+    if (!ALLOWED_DARK_HUES.has(darkHueRaw)) return null;
+    darkHue = darkHueRaw;
+  }
+
+  if (hasUiScale) {
+    const uiScaleRaw = String(themeSettings.uiScale || "")
+      .trim()
+      .toLowerCase();
+    if (!ALLOWED_UI_SCALES.has(uiScaleRaw)) return null;
+    uiScale = uiScaleRaw;
+  }
+
+  if (hasIconScale) {
+    const iconScaleRaw = String(themeSettings.iconScale || "")
+      .trim()
+      .toLowerCase();
+    if (!ALLOWED_ICON_SCALES.has(iconScaleRaw)) return null;
+    iconScale = iconScaleRaw;
+  }
+
+  if (hasLayoutDensity) {
+    const layoutDensityRaw = String(themeSettings.layoutDensity || "")
+      .trim()
+      .toLowerCase();
+    if (!ALLOWED_LAYOUT_DENSITIES.has(layoutDensityRaw)) return null;
+    layoutDensity = layoutDensityRaw;
+  }
+
+  if (hasSurfaceStyle) {
+    const surfaceStyleRaw = String(themeSettings.surfaceStyle || "")
+      .trim()
+      .toLowerCase();
+    if (!ALLOWED_SURFACE_STYLES.has(surfaceStyleRaw)) return null;
+    surfaceStyle = surfaceStyleRaw;
+  }
+
+  return { preset, mode, darkHue, uiScale, iconScale, layoutDensity, surfaceStyle };
 }
 
 /**
@@ -100,7 +202,7 @@ router.put("/", verifySupabaseToken, async (req, res) => {
       if (!normalizedTheme) {
         return res.status(400).json({
           message:
-            "Invalid theme settings. Allowed presets: emerald, aurora, ocean, sunset, forest. Allowed modes: light, dark.",
+            "Invalid theme settings. Allowed presets: emerald, aurora, ocean, sunset, forest. Allowed modes: light, dark. Allowed darkHue: plum, midnight, graphite, forest-night, ember. Allowed uiScale: compact, standard, large. Allowed iconScale: small, medium, large. Allowed layoutDensity: compact, balanced, spacious. Allowed surfaceStyle: soft, glass, solid.",
         });
       }
       updates.theme_settings = normalizedTheme;

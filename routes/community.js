@@ -14,6 +14,7 @@ const PRIMARY_ROOM = {
 const BUBBLE_TONES = new Set(["theme", "ocean", "sunset"]);
 const DENSITIES = new Set(["comfortable", "compact"]);
 const WALLPAPERS = new Set(["aurora", "graphite", "sunrise"]);
+const ATTACHMENT_KINDS = new Set(["text", "image", "video", "audio", "document"]);
 
 function normalizeText(value, max = 5000) {
   return String(value || "")
@@ -25,6 +26,33 @@ function normalizeText(value, max = 5000) {
 function normalizeOptionalText(value, max = 255) {
   const normalized = normalizeText(value, max);
   return normalized || null;
+}
+
+function sanitizeMessageMetadata(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  const metadata = {};
+  const mimeType = normalizeOptionalText(value.mimeType, 160);
+  const storageBucket = normalizeOptionalText(value.storageBucket, 80);
+  const storagePath = normalizeOptionalText(value.storagePath, 500);
+
+  if (mimeType) metadata.mimeType = mimeType;
+  if (storageBucket) metadata.storageBucket = storageBucket;
+  if (storagePath) metadata.storagePath = storagePath;
+
+  const fileSize = Number(value.fileSize);
+  if (Number.isFinite(fileSize) && fileSize >= 0) {
+    metadata.fileSize = Math.floor(fileSize);
+  }
+
+  const durationMs = Number(value.durationMs);
+  if (Number.isFinite(durationMs) && durationMs >= 0) {
+    metadata.durationMs = Math.floor(durationMs);
+  }
+
+  return metadata;
 }
 
 function isMissingCommunityTablesError(err) {
@@ -216,15 +244,20 @@ router.post("/rooms/:roomId/messages", async (req, res) => {
     )
       .trim()
       .toLowerCase();
-    const attachmentKind = attachmentKindRaw === "image" ? "image" : "text";
-    const metadata =
-      req.body?.metadata && typeof req.body.metadata === "object"
-        ? req.body.metadata
-        : {};
+    const attachmentKind = ATTACHMENT_KINDS.has(attachmentKindRaw)
+      ? attachmentKindRaw
+      : "text";
+    const metadata = sanitizeMessageMetadata(req.body?.metadata);
 
     if (!message && !attachmentUrl) {
       return res.status(400).json({
         message: "Add a message or an attachment before sending.",
+      });
+    }
+
+    if (attachmentUrl && !ATTACHMENT_KINDS.has(attachmentKind)) {
+      return res.status(400).json({
+        message: "Unsupported community attachment type.",
       });
     }
 
